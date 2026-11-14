@@ -750,6 +750,54 @@ static struct model_run run_model(enum model_fixture fx, uint32_t caps, uint64_t
 
 #undef FOLD
 
+/* The 1.0 chase through ee_tick_mind with the reservoirs held at zero (Zig: "a mind held
+ * at rest reproduces 1.0's chase trace exactly"). With the ten capabilities 1.1 defined
+ * it is the 1.0 chase digest; with 0xFFFFFFFF — which now includes
+ * EE_CAP_OBSERVATION_CUES and never gives a cue — the agent stalks (ADR-0014 §9). */
+static uint64_t run_chase_at_rest(uint32_t caps, unsigned *stalks)
+{
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = caps;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return 0;
+    }
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+    uint64_t digest = 0;
+    *stalks = 0;
+    for (uint64_t t = 0; t < 10000u; ++t) {
+        const ee_snapshot snap = make_chase_snapshot(t);
+        ee_intent i;
+        memset(&i, 0, sizeof i);
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, NULL) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        mind.arousal = 0;
+        mind.fear = 0;
+        mind.grievance = 0;
+        if (i.action == EE_ACTION_TAKE_COVER) (*stalks)++;
+        digest = digest * 1099511628211ULL + i.action;
+        digest = digest * 1099511628211ULL + i.target_id;
+        digest = digest * 1099511628211ULL + (uint64_t)(int64_t)i.move_x;
+        digest = digest * 1099511628211ULL + i.flags;
+    }
+    return digest;
+}
+
 static void print_model(const char *name, const struct model_run *r)
 {
     printf("  model %-22s digest %llu (first_engage=%ld at=%d caught=%u@%ld exposed=%u exposed_no_cue=%u stalk=%u expiry=%ld own_attack=%u)\n",
@@ -1020,6 +1068,19 @@ int main(void)
         print_model("false-exposure-control", &fec);
         print_model("ambush", &am);
         print_model("ambush-control", &amc);
+
+        const uint32_t caps_1_1 = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_RAYCAST
+            | EE_CAP_WAYPOINT_GRAPH | EE_CAP_SPAWN_RIGHTS | EE_CAP_ANIMATION_HOOKS | EE_CAP_DAMAGE_EVENTS
+            | EE_CAP_SOUND_EVENTS | EE_CAP_VEHICLE_BOARDING | EE_CAP_TERRAIN_HEIGHT;
+        unsigned rest_stalks = 0, all_stalks = 0;
+        const uint64_t rest = run_chase_at_rest(caps_1_1, &rest_stalks);
+        const uint64_t all_bits = run_chase_at_rest(0xFFFFFFFFu, &all_stalks);
+        printf("  model %-22s digest %llu (stalks=%u)\n", "chase-at-rest-1.1-caps", (unsigned long long)rest, rest_stalks);
+        printf("  model %-22s digest %llu (stalks=%u)\n", "chase-all-bits", (unsigned long long)all_bits, all_stalks);
+        check(rest == 12283675074724005768ULL && rest_stalks == 0u,
+              "a mind at rest with every 1.1 capability reproduces the 1.0 chase digest");
+        check(all_bits == 421035655961441872ULL && all_stalks > 0u,
+              "declaring every bit declares the cue capability: false concealment, pinned");
 
         check(st.digest == 5067313941334346860ULL, "the stalker digest matches the pinned value");
         check(stc.digest == 5359463348611598049ULL, "the stalker-control digest matches the pinned value");
