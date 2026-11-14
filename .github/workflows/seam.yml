@@ -55,16 +55,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
 
-      # Idris2 0.7.0 is bootstrapped from source (no Linux binaries exist upstream)
-      # and its libraries live under ~/.idris2, so both paths are cached. This is
-      # the difference between a 13-minute job and a 30-second one.
+      # Idris2 0.7.0 is bootstrapped from source (no Linux binaries exist upstream).
+      # Everything it needs — binary, libraries, backend support files — lives under
+      # the one toolchain prefix (scripts/install-toolchain.sh, corrected
+      # 2026-11-14), so that one path is cached. This is the difference between a
+      # 13-minute job and a 30-second one.
+      #
+      # The key carries `onepfx`: caches saved under the old key hold the
+      # half-installed layout (libraries in ~/.idris2, support files under the
+      # prefix) that made every seam-check since 2026-10-01 fail. A hit on that key
+      # would be rebuilt by the script on every run and never re-saved, so the key
+      # changes with the layout.
       - name: Cache toolchain
         uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cache/evil-weevil/toolchain
-            ~/.idris2
-          key: ee-toolchain-zig0.16.0-idris2-0.7.0-${{ runner.os }}-${{ runner.arch }}
+          key: ee-toolchain-zig0.16.0-idris2-0.7.0-onepfx-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install the pinned toolchain (zig, idris2, just — all three, all pinned)
         run: |
@@ -108,6 +115,17 @@ jobs:
 
       - name: No unfilled placeholders
         run: bash scripts/check-no-placeholders.sh
+
+      # `just validate` needs `just` and nothing else, and ubuntu-latest has no
+      # `just`: this step failed with "just: command not found" (exit 127) on every
+      # run. `--only just` installs the same pinned, SHA-256-checked binary the seam
+      # job uses, in seconds, and no compiler — which is what "no toolchain needed"
+      # in this job's name means. The name is unchanged on purpose: renaming a job
+      # renames its check, which would detach any required-status-check rule.
+      - name: Install just (pinned, SHA-256-checked; no compilers)
+        run: |
+          bash scripts/install-toolchain.sh --only just
+          echo "$HOME/.cache/evil-weevil/toolchain/bin" >> "$GITHUB_PATH"
 
       - name: RSR validators
         run: just validate

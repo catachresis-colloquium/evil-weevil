@@ -4,7 +4,7 @@
 #
 # install-toolchain.sh — the three tools this repository cannot be checked without.
 #
-#   bash scripts/install-toolchain.sh [--check] [--prefix DIR]
+#   bash scripts/install-toolchain.sh [--check] [--prefix DIR] [--only TOOL ...]
 #
 #     --check    report what is present and missing; install nothing, exit 1 if
 #                anything is missing. Use this in CI as a fast preflight, and on
@@ -13,6 +13,11 @@
 #                CI passes a directory it caches; the default is a cache path
 #                precisely so a local install is also a cache and never lands in
 #                the repository.
+#     --only     install and verify only TOOL (zig, idris2 or just); repeat it
+#                for more than one. The default is all three. A job that needs
+#                only `just` (the house gates in seam.yml) takes it from here, so
+#                it gets the same pinned, SHA-256-checked binary and not a second
+#                download written into a workflow.
 #
 # WHY A SCRIPT AND NOT A LIST OF APT PACKAGES
 #
@@ -56,13 +61,29 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PREFIX="${EE_TOOLCHAIN_PREFIX:-$HOME/.cache/evil-weevil/toolchain}"
 CHECK_ONLY=0
+# Which tools this run is about. All three unless --only narrows it.
+WANT_ZIG=1
+WANT_IDRIS2=1
+WANT_JUST=1
+ONLY_SEEN=0
+
+usage() { echo "usage: $(basename "$0") [--check] [--prefix DIR] [--only zig|idris2|just ...]" >&2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK_ONLY=1 ;;
         --prefix) PREFIX="${2:?--prefix needs a directory}"; shift ;;
-        -h|--help) sed -n '4,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $(basename "$0") [--check] [--prefix DIR]" >&2; exit 2 ;;
+        --only)
+            if [ "$ONLY_SEEN" -eq 0 ]; then WANT_ZIG=0; WANT_IDRIS2=0; WANT_JUST=0; ONLY_SEEN=1; fi
+            case "${2:-}" in
+                zig) WANT_ZIG=1 ;;
+                idris2) WANT_IDRIS2=1 ;;
+                just) WANT_JUST=1 ;;
+                *) echo "--only needs one of: zig, idris2, just (got '${2:-}')" >&2; usage; exit 2 ;;
+            esac
+            shift ;;
+        -h|--help) sed -n '4,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) usage; exit 2 ;;
     esac
     shift
 done
@@ -92,8 +113,20 @@ JUST_HAVE="$(just_version)"
 # A toolchain script's job is that the tools WORK, not that they exist. A compiler
 # that starts and cannot find its own base library is a failure no version string
 # reveals — and it is the failure a relocated install produces.
+#
+# Two probes, because they fail independently and the first alone was not enough.
+# The type-check probe needs only the LIBRARIES. Building an executable also needs
+# the backend SUPPORT files (chez/support.ss, libidris2_support.so), and those can
+# be missing while every library is present: from 2026-10-01 until this probe
+# existed, CI's install passed the type-check probe, `just proof-check-idris2`
+# passed, and `just seam-check` died at its first command building the ABI
+# generator ("Can't find data file chez/support.ss"). The seam gate has to build
+# and run a program, so the verification has to as well.
+#
+# Returns 0 if both pass, 1 if the libraries are unreachable, 2 if a program cannot
+# be built or does not run correctly.
 verify_idris2() {
-    local probe
+    local probe rc=0
     probe="$(mktemp -d)"
     cat > "$probe/Probe.idr" <<'PROBE'
 module Probe
@@ -105,41 +138,76 @@ import Data.Nat
 theCompilersBaseLibraryIsReachable : LTE 3 5
 theCompilersBaseLibraryIsReachable = LTESucc (LTESucc (LTESucc LTEZero))
 PROBE
-    if ( cd "$probe" && idris2 --check Probe.idr >/dev/null 2>&1 ); then
-        rm -rf "$probe"
-        return 0
+    cat > "$probe/Main.idr" <<'PROBE'
+module Main
+
+main : IO ()
+main = putStrLn "ee-codegen-probe-ok"
+PROBE
+    if ! ( cd "$probe" && idris2 --check Probe.idr >/dev/null 2>&1 ); then
+        rc=1
+    elif [ "$( cd "$probe" && idris2 Main.idr -o probe >/dev/null 2>&1 \
+               && ./build/exec/probe 2>/dev/null )" != "ee-codegen-probe-ok" ]; then
+        # Checked by the program's OUTPUT, not by idris2's exit status: idris2
+        # exits 0 after "INTERNAL ERROR: Can't find data file", having built
+        # nothing (measured with 0.7.0).
+        rc=2
     fi
     rm -rf "$probe"
-    return 1
+    return "$rc"
+}
+
+# Why verify_idris2 failed, in words a person can act on.
+explain_idris2_failure() {
+    case "$1" in
+        1) say "      idris2 cannot find its base libraries (a module importing Data.Nat"
+           say "      does not type-check)." ;;
+        2) say "      idris2 type-checks but cannot build and run a program: its backend"
+           say "      support files (chez/support.ss, libidris2_support.so) are not where"
+           say "      it looks. This is the half-installed layout this script produced"
+           say "      before 2026-11-14; reinstalling with this script repairs it." ;;
+    esac
 }
 
 say "evil-weevil toolchain"
-say "  zig     want $ZIG_VERSION  have ${ZIG_HAVE:-none}"
-say "  idris2 want $IDRIS2_VERSION  have ${IDRIS2_HAVE:-none}"
-say "  just    want $JUST_VERSION  have ${JUST_HAVE:-none}"
+[ "$WANT_ZIG" -eq 1 ]    && say "  zig     want $ZIG_VERSION  have ${ZIG_HAVE:-none}"
+[ "$WANT_IDRIS2" -eq 1 ] && say "  idris2 want $IDRIS2_VERSION  have ${IDRIS2_HAVE:-none}"
+[ "$WANT_JUST" -eq 1 ]   && say "  just    want $JUST_VERSION  have ${JUST_HAVE:-none}"
 
 missing=0
-[ "$ZIG_HAVE" = "$ZIG_VERSION" ] || missing=$((missing + 1))
-[ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ] || missing=$((missing + 1))
-[ "$JUST_HAVE" = "$JUST_VERSION" ] || missing=$((missing + 1))
+[ "$WANT_ZIG" -eq 0 ]    || [ "$ZIG_HAVE" = "$ZIG_VERSION" ]       || missing=$((missing + 1))
+[ "$WANT_IDRIS2" -eq 0 ] || [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ] || missing=$((missing + 1))
+[ "$WANT_JUST" -eq 0 ]   || [ "$JUST_HAVE" = "$JUST_VERSION" ]     || missing=$((missing + 1))
+
+# An idris2 at the right version that fails verification is a broken install, not
+# a missing one. --check reports it and fails; an install run rebuilds it, rather
+# than exiting and leaving the broken copy for the next run to find again.
+IDRIS2_BROKEN=0
+if [ "$WANT_IDRIS2" -eq 1 ] && [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ]; then
+    verify_rc=0
+    verify_idris2 || verify_rc=$?
+    if [ "$verify_rc" -ne 0 ]; then
+        say ""
+        say "  idris2 $IDRIS2_HAVE at $(command -v idris2) FAILS verification:"
+        explain_idris2_failure "$verify_rc"
+        IDRIS2_BROKEN=1
+        missing=$((missing + 1))
+    fi
+fi
 
 if [ "$missing" -eq 0 ]; then
-    if verify_idris2; then
-        say ""
-        say "PASS: all three tools present at the pinned versions, and idris2 compiles"
-        say "      a module that imports Data.Nat."
-        say "      (zig: $(command -v zig), idris2: $(command -v idris2), just: $(command -v just))"
-        exit 0
-    fi
     say ""
-    say "FAIL: idris2 is at the right version but cannot find its base library."
-    say "      Check IDRIS2_PREFIX, \$HOME/.idris2, or reinstall with this script."
-    exit 1
+    say "PASS: every requested tool is present at its pinned version."
+    [ "$WANT_IDRIS2" -eq 1 ] && say "      idris2 type-checks a module importing Data.Nat AND builds and runs a program."
+    [ "$WANT_ZIG" -eq 1 ]    && say "      zig:    $(command -v zig)"
+    [ "$WANT_IDRIS2" -eq 1 ] && say "      idris2: $(command -v idris2)"
+    [ "$WANT_JUST" -eq 1 ]   && say "      just:   $(command -v just)"
+    exit 0
 fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     say ""
-    say "FAIL: $missing tool(s) missing or at the wrong version."
+    say "FAIL: $missing tool(s) missing, at the wrong version, or failing verification."
     say "      Run: bash scripts/install-toolchain.sh   (or --prefix DIR to choose where)"
     exit 1
 fi
@@ -202,6 +270,10 @@ install_idris2() {
     say ""
     say "==> idris2 $IDRIS2_VERSION (bootstrapped with Chez Scheme)"
     local dir="$PREFIX/idris2-$IDRIS2_VERSION"
+    if [ "$IDRIS2_BROKEN" -eq 1 ] && [ -d "$dir" ]; then
+        say "    removing the broken install at $dir before rebuilding it"
+        rm -rf "$dir"
+    fi
     if [ ! -x "$dir/bin/idris2" ]; then
         if ! have chezscheme && ! have scheme && ! have chez; then
             say "    installing chezscheme (needs sudo)"
@@ -221,28 +293,38 @@ install_idris2() {
             rm -f "$PREFIX/src/idris2.tar.gz"
         fi
 
+        # ONE prefix, given to BOTH steps. `make bootstrap` compiles the prefix
+        # INTO the binary (src/IdrisPaths.idr, `yprefix`), and that compiled-in
+        # prefix is where idris2 looks for everything at run time: its base
+        # libraries and its backend support files alike.
+        #
+        # CORRECTED 2026-11-14. This used to pass PREFIX to `make install` only. The
+        # bootstrap then compiled in the default, ~/.idris2, so the libraries (which
+        # `make install` installs by running idris2 --install) followed the binary
+        # to ~/.idris2, while the support files (installed by plain `make`) went to
+        # $dir. The comment here read that split as a property of Idris2 and kept
+        # it. The result type-checked and could not build a program, and the seam
+        # gate needs to build one. With one prefix, everything is under $dir, and
+        # ~/.idris2 is not used at all.
+        #
+        # `make clean` first: a source tree bootstrapped against another prefix
+        # carries build products that the new prefix must not inherit.
         say "    bootstrapping (this takes minutes; -j1 because stage 2 is memory-hungry)"
-        ( cd "$src" && SCHEME="$scheme" make bootstrap -j1 )
+        ( cd "$src" && make clean >/dev/null 2>&1 || true )
+        ( cd "$src" && SCHEME="$scheme" make bootstrap -j1 PREFIX="$dir" )
         ( cd "$src" && make install PREFIX="$dir" )
-
-        # Idris2 finds its support files and base libraries through IDRIS2_PREFIX,
-        # defaulting to ~/.idris2 — deliberately NOT under the --prefix we pass to
-        # make (measured: the libraries land in the default location even when an
-        # install PREFIX is given). That default is left alone rather than fought:
-        # it means a bare `idris2 --check foo.idr` works with no environment set,
-        # which is what a contributor expects and what the justrecipes assume. CI
-        # therefore caches ~/.idris2 as well as the prefix. Set IDRIS2_PREFIX
-        # yourself to relocate it; this script does not move libraries it did not
-        # put there.
     fi
     mkdir -p "$PREFIX/bin"
     ln -sf "$dir/bin/idris2" "$PREFIX/bin/idris2"
     say "    installed $("$PREFIX/bin/idris2" --version | head -1) at $dir/bin/idris2"
 }
 
-[ "$JUST_HAVE" = "$JUST_VERSION" ] || install_just
-[ "$ZIG_HAVE" = "$ZIG_VERSION" ] || install_zig
-[ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ] || install_idris2
+[ "$WANT_JUST" -eq 0 ] || [ "$JUST_HAVE" = "$JUST_VERSION" ] || install_just
+[ "$WANT_ZIG" -eq 0 ]  || [ "$ZIG_HAVE" = "$ZIG_VERSION" ]   || install_zig
+# A broken install at the right version is rebuilt too: the version is not the test.
+if [ "$WANT_IDRIS2" -eq 1 ] && { [ "$IDRIS2_HAVE" != "$IDRIS2_VERSION" ] || [ "$IDRIS2_BROKEN" -eq 1 ]; }; then
+    install_idris2
+fi
 
 # ── Verify, rather than announce ─────────────────────────────────────────────
 # The point of a toolchain script is that the tools WORK, not that they exist. A
@@ -257,16 +339,26 @@ say ""
 # shape a verification step can take.
 export PATH="$PREFIX/bin:$PATH"
 say "==> verifying the installed toolchain"
-if verify_idris2; then
-    say "    idris2: compiles a module that imports Data.Nat"
-else
-    say "    FAIL: idris2 cannot compile a module importing Data.Nat."
-    say "          Its libraries are not where it looks for them."
-    say "          Check IDRIS2_PREFIX (to relocate) or \$HOME/.idris2."
-    exit 1
+if [ "$WANT_IDRIS2" -eq 1 ]; then
+    verify_rc=0
+    verify_idris2 || verify_rc=$?
+    if [ "$verify_rc" -eq 0 ]; then
+        say "    idris2: type-checks a module importing Data.Nat, and builds and runs a program"
+    else
+        say "    FAIL: the idris2 just installed does not verify."
+        explain_idris2_failure "$verify_rc"
+        exit 1
+    fi
 fi
-say "    zig:    $(zig version) at $(command -v zig)"
-say "    just:   $(just --version) at $(command -v just)"
+# Each requested tool must RUN at its pinned version, not merely exist on PATH.
+if [ "$WANT_ZIG" -eq 1 ]; then
+    [ "$(zig_version)" = "$ZIG_VERSION" ] || { say "    FAIL: zig does not run at $ZIG_VERSION"; exit 1; }
+    say "    zig:    $(zig version) at $(command -v zig)"
+fi
+if [ "$WANT_JUST" -eq 1 ]; then
+    [ "$(just_version)" = "$JUST_VERSION" ] || { say "    FAIL: just does not run at $JUST_VERSION"; exit 1; }
+    say "    just:   $(just --version) at $(command -v just)"
+fi
 
 say "==================================================================="
 say "Add the toolchain to this shell:"
