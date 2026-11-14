@@ -10,6 +10,19 @@ https://semver.org/spec/v2.0.0.html[Semantic Versioning].
 
 ==== Added
 
+* ABI 1.2, mind slice 2 (ADR-0014, Proposed): the agent models its target's
+  knowledge. Under the new `EE_CAP_OBSERVATION_CUES`, a contact flagged
+  `EE_CONTACT_FLAG_OBSERVES` sets *exposure*, a belief held in `ee_agent.flags`
+  bits 4 and 8..15. It is kept for a fixed lifetime after the last cue, also set by
+  the agent's own attack, and every change carries its cause. A new candidate,
+  stalk (`EE_ACTION_TAKE_COVER`, mode 5), closes the range in cover and engages only
+  inside strike range. A new tell, CAUGHT, freezes the agent for one tick when the cue
+  arrives while it stalks. A new struct, `ee_model_trace`, has the 1.1
+  `ee_mind_trace` as its first member. `ee_tick_mind` writes it when the trace's
+  `struct_size` says so, and writes a 1.1-sized trace exactly as before. Specified and
+  proved in `src/interface/Abi/Exposure.idr`. Eight new fixtures pinned by both null
+  hosts. The ten 1.0 and 1.1 digests, `EE_ABI_FINGERPRINT` (18276775) and
+  `EE_MIND_FINGERPRINT` (1047490) are unchanged.
 * ABI 1.1, mind slice 1 (ADR-0013, Proposed): `ee_tick_mind`, a new entrance
   beside an unchanged `ee_tick`, with caller-owned `ee_mind` state and an
   `ee_mind_trace` record. Three integer affect reservoirs (arousal, fear,
