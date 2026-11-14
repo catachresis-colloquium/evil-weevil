@@ -596,6 +596,178 @@ static struct crowd_run run_crowd(void)
     return r;
 }
 
+/* ── ABI 1.2: the model of the target's knowledge (ADR-0014) ─────────────────
+ *
+ * The same four fixtures as src/interface/ffi/test/null_host.zig, each with a control
+ * that withholds EE_CAP_OBSERVATION_CUES and changes nothing else, through the exported
+ * ee_tick_mind with a 1.2 record: `&model.mind`, `mind.struct_size = sizeof model`. */
+
+enum model_fixture { STALKER, CAUGHT, FALSE_EXPOSURE, AMBUSH };
+
+#define MODEL_CLOSE_STEP 2048
+#define MODEL_CAUGHT_TICK 100u
+#define MODEL_GLANCE_TICK 20u
+
+struct model_run {
+    uint64_t digest;
+    long first_engage, caught_tick, first_exposed, first_stalk_after_cue, expiry_tick;
+    ee_fx engage_distance;
+    unsigned caught, exposed_ticks, exposed_no_cue, stalk_selected, stalk_ranked;
+    unsigned stalk_after_cue, own_attack, max_rank, uncaused, unexplained, tells_mismatch;
+};
+
+static int model_cue_at(enum model_fixture fx, uint64_t t)
+{
+    return (fx == CAUGHT && t == MODEL_CAUGHT_TICK) || (fx == FALSE_EXPOSURE && t == MODEL_GLANCE_TICK);
+}
+
+static ee_snapshot make_model_snapshot(enum model_fixture fx, uint64_t t, ee_fx distance)
+{
+    ee_snapshot s;
+    memset(&s, 0, sizeof s);
+    s.tick = t;
+    s.agent_id = 7;
+    s.capability_mask = 0xFFFFFFFFu;
+    s.health = EE_FX_ONE;
+    s.ammo = (ee_fx)(3 * EE_FX_ONE);
+    if (fx != AMBUSH || t < 30u) {
+        const uint16_t fl = model_cue_at(fx, t) ? (uint16_t)EE_CONTACT_FLAG_OBSERVES : 0u;
+        s.contact0 = mind_contact(41, fl, 16384, 8192, distance, EE_FX_ONE / 2);
+        s.contact_count = 1;
+    }
+    return s;
+}
+
+#define FOLD(x) (r.digest = r.digest * 1099511628211ULL + (uint64_t)(x))
+
+static struct model_run run_model(enum model_fixture fx, uint32_t caps, uint64_t ticks)
+{
+    struct model_run r;
+    memset(&r, 0, sizeof r);
+    r.first_engage = r.caught_tick = r.first_exposed = r.first_stalk_after_cue = r.expiry_tick = -1;
+
+    ee_init_desc desc;
+    memset(&desc, 0, sizeof desc);
+    desc.struct_size = (uint32_t)sizeof desc;
+    desc.abi_major = EE_ABI_MAJOR;
+    desc.abi_minor = EE_ABI_MINOR;
+    desc.capabilities = caps;
+    desc.max_agents = 1;
+    desc.rng_seed = 0xEE0000000000001ULL;
+    desc.abi_fingerprint = EE_ABI_FINGERPRINT;
+    ee_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    if (ee_init(&desc, &ctx) != EE_STATUS_OK) {
+        failures++;
+        return r;
+    }
+    check(ee_model_fingerprint() == EE_MODEL_FINGERPRINT, "the exported model fingerprint matches the header");
+
+    ee_agent agent;
+    memset(&agent, 0, sizeof agent);
+    agent.rng_state = 0xEE0000000000001ULL;
+    ee_mind mind;
+    memset(&mind, 0, sizeof mind);
+    mind.struct_size = (uint32_t)sizeof mind;
+
+    ee_fx distance = fx == AMBUSH ? 24576 : 196608;
+    long first_cue = -1;
+    for (uint64_t t = 0; t < ticks; ++t) {
+        const ee_snapshot snap = make_model_snapshot(fx, t, distance);
+        const int cue = model_cue_at(fx, t) && snap.contact_count > 0;
+        if (cue && first_cue < 0) first_cue = (long)t;
+        ee_intent i;
+        ee_model_trace m;
+        memset(&i, 0, sizeof i);
+        memset(&m, 0, sizeof m);
+        m.mind.struct_size = (uint32_t)sizeof m;
+        if (ee_tick_mind(&ctx, &snap, &agent, &mind, &i, &m.mind) != EE_STATUS_OK) {
+            failures++;
+            break;
+        }
+        if (m.mind.struct_size != sizeof m) failures++;
+        const ee_mind_trace *tr = &m.mind;
+
+        if (i.action == EE_ACTION_ATTACK && r.first_engage < 0) {
+            r.first_engage = (long)t;
+            r.engage_distance = distance;
+        }
+        if (tr->tells & EE_TELL_CAUGHT) {
+            r.caught++;
+            if (r.caught_tick < 0) r.caught_tick = (long)t;
+        }
+        if (m.exposure == 1u) {
+            r.exposed_ticks++;
+            if (r.first_exposed < 0) r.first_exposed = (long)t;
+            if (!cue) r.exposed_no_cue++;
+        }
+        if (tr->selected == EE_AGENT_MODE_STALK) {
+            r.stalk_selected++;
+            if (first_cue >= 0 && (long)t > first_cue) {
+                r.stalk_after_cue++;
+                if (r.first_stalk_after_cue < 0) r.first_stalk_after_cue = (long)t;
+            }
+        }
+        for (unsigned k = 0; k < tr->ranking_count; ++k)
+            if (((tr->ranking >> (4u * k)) & 0xFu) == EE_AGENT_MODE_STALK) r.stalk_ranked++;
+        if (tr->ranking_count > r.max_rank) r.max_rank = tr->ranking_count;
+        if (m.exposure_cause == EE_EXPOSURE_CAUSE_OWN_ATTACK) r.own_attack++;
+        if (m.exposure_cause == EE_EXPOSURE_CAUSE_EXPIRY && r.expiry_tick < 0) r.expiry_tick = (long)t;
+        if ((m.exposure != m.exposure_prev) != (m.exposure_cause != EE_EXPOSURE_CAUSE_NONE)) r.uncaused++;
+        const uint32_t first = tr->ranking & 0xFu;
+        if (tr->selected != first && tr->selected != tr->incumbent) r.unexplained++;
+        if (((i.flags >> 4) & 0xFu) != tr->tells) r.tells_mismatch++;
+
+        FOLD(i.action);
+        FOLD(i.target_id);
+        FOLD((int64_t)i.move_x);
+        FOLD((int64_t)i.move_y);
+        FOLD((int64_t)i.look_x);
+        FOLD((int64_t)i.speed);
+        FOLD(i.priority);
+        FOLD(i.flags);
+        FOLD(tr->ranking);
+        FOLD(tr->ranking_count);
+        FOLD(tr->selected);
+        FOLD(tr->incumbent);
+        FOLD(tr->token);
+        FOLD(tr->cause);
+        FOLD(tr->tells);
+        FOLD(m.exposure);
+        FOLD(m.exposure_prev);
+        FOLD(m.exposure_cause);
+        FOLD(m.exposure_contact);
+
+        /* The world: the range closes while the agent moves toward the target; in
+         * "false exposure" the target keeps its distance. */
+        if (fx != FALSE_EXPOSURE && (i.action == EE_ACTION_ADVANCE || i.action == EE_ACTION_TAKE_COVER)) {
+            distance -= (ee_fx)(((int64_t)i.speed * MODEL_CLOSE_STEP) >> 16);
+            if (distance < 0) distance = 0;
+        }
+    }
+    return r;
+}
+
+#undef FOLD
+
+static void print_model(const char *name, const struct model_run *r)
+{
+    printf("  model %-22s digest %llu (first_engage=%ld at=%d caught=%u@%ld exposed=%u exposed_no_cue=%u stalk=%u expiry=%ld own_attack=%u)\n",
+           name, (unsigned long long)r->digest, r->first_engage, (int)r->engage_distance, r->caught,
+           r->caught_tick, r->exposed_ticks, r->exposed_no_cue, r->stalk_selected, r->expiry_tick,
+           r->own_attack);
+}
+
+static int model_invariants(const struct model_run *r)
+{
+    return r->uncaused == 0u && r->unexplained == 0u && r->tells_mismatch == 0u;
+}
+
+static int model_is_one_one(const struct model_run *r)
+{
+    return r->exposed_ticks == 0u && r->stalk_ranked == 0u && r->caught == 0u && r->max_rank <= 5u;
+}
+
 int main(void)
 {
     /* Layout, as this compiler produced it. The header already asserted these at
@@ -825,6 +997,51 @@ int main(void)
               "fear breaks the engagement when the wound returns, and the agent stays in flight");
         check(c.fear_at_119 == 43413u, "fear before the contest is the pinned value");
         check(c.unexplained == 0u && c.uncaused == 0u, "the crowd's trace is explained and caused");
+    }
+
+    /* ABI 1.2: the model. Four fixtures and four controls, eight pinned digests shared
+     * with the Zig host, and the measured figures the slice is judged on. */
+    {
+        const uint32_t caps = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT | EE_CAP_OBSERVATION_CUES;
+        const uint32_t no_cues = EE_CAP_NAVMESH | EE_CAP_LINE_OF_SIGHT;
+        const struct model_run st = run_model(STALKER, caps, 200u);
+        const struct model_run stc = run_model(STALKER, no_cues, 200u);
+        const struct model_run ca = run_model(CAUGHT, caps, 200u);
+        const struct model_run cac = run_model(CAUGHT, no_cues, 200u);
+        const struct model_run fe = run_model(FALSE_EXPOSURE, caps, 200u);
+        const struct model_run fec = run_model(FALSE_EXPOSURE, no_cues, 200u);
+        const struct model_run am = run_model(AMBUSH, caps, 200u);
+        const struct model_run amc = run_model(AMBUSH, no_cues, 200u);
+        print_model("stalker", &st);
+        print_model("stalker-control", &stc);
+        print_model("caught", &ca);
+        print_model("caught-control", &cac);
+        print_model("false-exposure", &fe);
+        print_model("false-exposure-control", &fec);
+        print_model("ambush", &am);
+        print_model("ambush-control", &amc);
+
+        check(st.digest == 5067313941334346860ULL, "the stalker digest matches the pinned value");
+        check(stc.digest == 5359463348611598049ULL, "the stalker-control digest matches the pinned value");
+        check(ca.digest == 3395485040061069912ULL, "the caught digest matches the pinned value");
+        check(cac.digest == 5359463348611598049ULL, "the caught control is the stalker control: the cue bit is ignored without the capability");
+        check(fe.digest == 11105738738098638480ULL, "the false-exposure digest matches the pinned value");
+        check(fec.digest == 11366903142131820018ULL, "the false-exposure-control digest matches the pinned value");
+        check(am.digest == 1370696199260345134ULL, "the ambush digest matches the pinned value");
+        check(amc.digest == 10128845661911672413ULL, "the ambush-control digest matches the pinned value");
+
+        check(st.first_engage == 160 && st.engage_distance == 32768, "the stalker engages only inside strike range, at tick 160");
+        check(stc.first_engage == 64 && stc.engage_distance == 65536, "its control engages earlier, at tick 64, at attack range");
+        check(ca.caught == 1u && ca.caught_tick == 100 && ca.first_exposed == 100, "one CAUGHT tell, on the cue tick, exposed from it");
+        check(ca.stalk_after_cue == 0u, "after being caught the agent never stalks again");
+        check(fe.exposed_no_cue == 90u && fec.exposed_no_cue == 0u, "false exposure: 90 exposed ticks with no cue, against 0");
+        check(fe.expiry_tick == 111 && fe.first_stalk_after_cue == 111, "the belief expires at 111 and the stalk resumes");
+        check(am.first_exposed == 0 && am.own_attack == 1u && am.expiry_tick == 120, "the agent's own attack sets exposure, which then expires");
+        check(model_is_one_one(&stc) && model_is_one_one(&cac) && model_is_one_one(&fec) && model_is_one_one(&amc),
+              "every control is ABI 1.1: no exposure, no stalk, no CAUGHT");
+        check(model_invariants(&st) && model_invariants(&stc) && model_invariants(&ca) && model_invariants(&cac)
+              && model_invariants(&fe) && model_invariants(&fec) && model_invariants(&am) && model_invariants(&amc),
+              "every exposure change has a cause, every selection is explained, every tell is on the intent");
     }
 
     if (failures) {
