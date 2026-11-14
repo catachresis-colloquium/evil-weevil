@@ -106,6 +106,21 @@ pub const CAUSE_ATTRIBUTED_DAMAGE = layout.CAUSE_ATTRIBUTED_DAMAGE;
 pub const CAUSE_DECAY = layout.CAUSE_DECAY;
 pub const MASS_FULL = layout.MASS_FULL;
 
+// ABI 1.2 (ADR-0014): the names of the model of the target's knowledge.
+pub const MODEL_FINGERPRINT = layout.model_fingerprint;
+pub const CAP_OBSERVATION_CUES = layout.CAP_OBSERVATION_CUES;
+pub const CONTACT_FLAG_OBSERVES = layout.CONTACT_FLAG_OBSERVES;
+pub const AGENT_FLAG_EXPOSED = layout.AGENT_FLAG_EXPOSED;
+pub const AGENT_EXPOSURE_SHIFT = layout.AGENT_EXPOSURE_SHIFT;
+pub const AGENT_EXPOSURE_MASK = layout.AGENT_EXPOSURE_MASK;
+pub const AGENT_MODE_STALK = layout.AGENT_MODE_STALK;
+pub const INTENT_FLAG_CAUGHT = layout.INTENT_FLAG_CAUGHT;
+pub const TELL_CAUGHT = layout.TELL_CAUGHT;
+pub const EXPOSURE_CAUSE_NONE = layout.EXPOSURE_CAUSE_NONE;
+pub const EXPOSURE_CAUSE_CUE = layout.EXPOSURE_CAUSE_CUE;
+pub const EXPOSURE_CAUSE_OWN_ATTACK = layout.EXPOSURE_CAUSE_OWN_ATTACK;
+pub const EXPOSURE_CAUSE_EXPIRY = layout.EXPOSURE_CAUSE_EXPIRY;
+
 // ── The ABI structs ─────────────────────────────────────────────────────────
 // `extern struct` gives C layout. Field order and types mirror Abi.Types exactly.
 
@@ -248,6 +263,18 @@ pub const EeMindTrace = extern struct {
     reserved0: u8,
 };
 
+// ABI 1.2 (ADR-0014). The 1.1 trace as the FIRST MEMBER, then the model. A host passes
+// `&model.mind` to `ee_tick_mind`; `mind.struct_size` says which record it is.
+pub const EeModelTrace = extern struct {
+    mind: EeMindTrace,
+    exposure_contact: u16,
+    exposure: u8,
+    exposure_prev: u8,
+    exposure_cause: u8,
+    reserved0: u8,
+    reserved1: u16,
+};
+
 // ── The comptime gate ───────────────────────────────────────────────────────
 // One helper, called once per field. If any of these fires, the Zig struct no
 // longer matches the ABI that Idris2 proved and the C compiler asserted — which
@@ -380,4 +407,14 @@ comptime {
     assertOffset(EeMindTrace, "cause", layout.offset_ee_mind_trace_cause, "ee_mind_trace.cause");
     assertOffset(EeMindTrace, "tells", layout.offset_ee_mind_trace_tells, "ee_mind_trace.tells");
     assertOffset(EeMindTrace, "reserved0", layout.offset_ee_mind_trace_reserved0, "ee_mind_trace.reserved0");
+
+    // ABI 1.2 — every field of the new struct.
+    assertSize(EeModelTrace, layout.sizeof_ee_model_trace, "ee_model_trace");
+    assertOffset(EeModelTrace, "mind", layout.offset_ee_model_trace_mind, "ee_model_trace.mind");
+    assertOffset(EeModelTrace, "exposure_contact", layout.offset_ee_model_trace_exposure_contact, "ee_model_trace.exposure_contact");
+    assertOffset(EeModelTrace, "exposure", layout.offset_ee_model_trace_exposure, "ee_model_trace.exposure");
+    assertOffset(EeModelTrace, "exposure_prev", layout.offset_ee_model_trace_exposure_prev, "ee_model_trace.exposure_prev");
+    assertOffset(EeModelTrace, "exposure_cause", layout.offset_ee_model_trace_exposure_cause, "ee_model_trace.exposure_cause");
+    assertOffset(EeModelTrace, "reserved0", layout.offset_ee_model_trace_reserved0, "ee_model_trace.reserved0");
+    assertOffset(EeModelTrace, "reserved1", layout.offset_ee_model_trace_reserved1, "ee_model_trace.reserved1");
 }
