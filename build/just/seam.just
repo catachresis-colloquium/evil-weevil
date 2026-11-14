@@ -27,9 +27,21 @@
 # Build the ABI generator. Idris2 only links a PROGRAM here (the model and proofs
 # elsewhere are checked with --check, which is why `just proof-check-idris2` does
 # not need this step).
+#
+# The executable is CHECKED, not assumed: idris2 0.7.0 exits 0 after "INTERNAL
+# ERROR: Can't find data file chez/support.ss", having built nothing, and this
+# recipe used to print "built" over that and leave the next recipe to fail with
+# "No such file or directory" (measured in CI, every run from 2026-10-01).
 abi-gen-build:
     @echo "==> building the ABI generator (Idris2)"
+    @rm -f _build/idris2/exec/ee-abi-gen
     @idris2 --source-dir src/interface --build-dir _build/idris2 -o ee-abi-gen src/interface/Abi/Gen.idr
+    @if [ ! -x _build/idris2/exec/ee-abi-gen ]; then \
+      echo "FAIL: idris2 produced no _build/idris2/exec/ee-abi-gen (see its output above)."; \
+      echo "      If it reports a missing chez/support.ss, the Idris2 install is half-done:"; \
+      echo "      run 'bash scripts/install-toolchain.sh', which detects and rebuilds it."; \
+      exit 1; \
+    fi
     @echo "    built _build/idris2/exec/ee-abi-gen"
 
 # Regenerate the C header and the Zig layout from the Idris2 model.

@@ -55,16 +55,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
 
-      # Idris2 0.7.0 is bootstrapped from source (no Linux binaries exist upstream)
-      # and its libraries live under ~/.idris2, so both paths are cached. This is
-      # the difference between a 13-minute job and a 30-second one.
+      # Idris2 0.7.0 is bootstrapped from source (no Linux binaries exist upstream).
+      # Everything it needs — binary, libraries, backend support files — lives under
+      # the one toolchain prefix (scripts/install-toolchain.sh, corrected
+      # 2026-11-14), so that one path is cached. This is the difference between a
+      # 13-minute job and a 30-second one.
+      #
+      # The key carries `onepfx`: caches saved under the old key hold the
+      # half-installed layout (libraries in ~/.idris2, support files under the
+      # prefix) that made every seam-check since 2026-10-01 fail. A hit on that key
+      # would be rebuilt by the script on every run and never re-saved, so the key
+      # changes with the layout.
       - name: Cache toolchain
         uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cache/evil-weevil/toolchain
-            ~/.idris2
-          key: ee-toolchain-zig0.16.0-idris2-0.7.0-${{ runner.os }}-${{ runner.arch }}
+          key: ee-toolchain-zig0.16.0-idris2-0.7.0-onepfx-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install the pinned toolchain (zig, idris2, just — all three, all pinned)
         run: |
