@@ -116,5 +116,16 @@ jobs:
       - name: No unfilled placeholders
         run: bash scripts/check-no-placeholders.sh
 
+      # `just validate` needs `just` and nothing else, and ubuntu-latest has no
+      # `just`: this step failed with "just: command not found" (exit 127) on every
+      # run. `--only just` installs the same pinned, SHA-256-checked binary the seam
+      # job uses, in seconds, and no compiler — which is what "no toolchain needed"
+      # in this job's name means. The name is unchanged on purpose: renaming a job
+      # renames its check, which would detach any required-status-check rule.
+      - name: Install just (pinned, SHA-256-checked; no compilers)
+        run: |
+          bash scripts/install-toolchain.sh --only just
+          echo "$HOME/.cache/evil-weevil/toolchain/bin" >> "$GITHUB_PATH"
+
       - name: RSR validators
         run: just validate

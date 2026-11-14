@@ -4,7 +4,7 @@
 #
 # install-toolchain.sh — the three tools this repository cannot be checked without.
 #
-#   bash scripts/install-toolchain.sh [--check] [--prefix DIR]
+#   bash scripts/install-toolchain.sh [--check] [--prefix DIR] [--only TOOL ...]
 #
 #     --check    report what is present and missing; install nothing, exit 1 if
 #                anything is missing. Use this in CI as a fast preflight, and on
@@ -13,6 +13,11 @@
 #                CI passes a directory it caches; the default is a cache path
 #                precisely so a local install is also a cache and never lands in
 #                the repository.
+#     --only     install and verify only TOOL (zig, idris2 or just); repeat it
+#                for more than one. The default is all three. A job that needs
+#                only `just` (the house gates in seam.yml) takes it from here, so
+#                it gets the same pinned, SHA-256-checked binary and not a second
+#                download written into a workflow.
 #
 # WHY A SCRIPT AND NOT A LIST OF APT PACKAGES
 #
@@ -56,13 +61,29 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PREFIX="${EE_TOOLCHAIN_PREFIX:-$HOME/.cache/evil-weevil/toolchain}"
 CHECK_ONLY=0
+# Which tools this run is about. All three unless --only narrows it.
+WANT_ZIG=1
+WANT_IDRIS2=1
+WANT_JUST=1
+ONLY_SEEN=0
+
+usage() { echo "usage: $(basename "$0") [--check] [--prefix DIR] [--only zig|idris2|just ...]" >&2; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK_ONLY=1 ;;
         --prefix) PREFIX="${2:?--prefix needs a directory}"; shift ;;
-        -h|--help) sed -n '4,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "usage: $(basename "$0") [--check] [--prefix DIR]" >&2; exit 2 ;;
+        --only)
+            if [ "$ONLY_SEEN" -eq 0 ]; then WANT_ZIG=0; WANT_IDRIS2=0; WANT_JUST=0; ONLY_SEEN=1; fi
+            case "${2:-}" in
+                zig) WANT_ZIG=1 ;;
+                idris2) WANT_IDRIS2=1 ;;
+                just) WANT_JUST=1 ;;
+                *) echo "--only needs one of: zig, idris2, just (got '${2:-}')" >&2; usage; exit 2 ;;
+            esac
+            shift ;;
+        -h|--help) sed -n '4,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) usage; exit 2 ;;
     esac
     shift
 done
@@ -149,20 +170,20 @@ explain_idris2_failure() {
 }
 
 say "evil-weevil toolchain"
-say "  zig     want $ZIG_VERSION  have ${ZIG_HAVE:-none}"
-say "  idris2 want $IDRIS2_VERSION  have ${IDRIS2_HAVE:-none}"
-say "  just    want $JUST_VERSION  have ${JUST_HAVE:-none}"
+[ "$WANT_ZIG" -eq 1 ]    && say "  zig     want $ZIG_VERSION  have ${ZIG_HAVE:-none}"
+[ "$WANT_IDRIS2" -eq 1 ] && say "  idris2 want $IDRIS2_VERSION  have ${IDRIS2_HAVE:-none}"
+[ "$WANT_JUST" -eq 1 ]   && say "  just    want $JUST_VERSION  have ${JUST_HAVE:-none}"
 
 missing=0
-[ "$ZIG_HAVE" = "$ZIG_VERSION" ] || missing=$((missing + 1))
-[ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ] || missing=$((missing + 1))
-[ "$JUST_HAVE" = "$JUST_VERSION" ] || missing=$((missing + 1))
+[ "$WANT_ZIG" -eq 0 ]    || [ "$ZIG_HAVE" = "$ZIG_VERSION" ]       || missing=$((missing + 1))
+[ "$WANT_IDRIS2" -eq 0 ] || [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ] || missing=$((missing + 1))
+[ "$WANT_JUST" -eq 0 ]   || [ "$JUST_HAVE" = "$JUST_VERSION" ]     || missing=$((missing + 1))
 
 # An idris2 at the right version that fails verification is a broken install, not
 # a missing one. --check reports it and fails; an install run rebuilds it, rather
 # than exiting and leaving the broken copy for the next run to find again.
 IDRIS2_BROKEN=0
-if [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ]; then
+if [ "$WANT_IDRIS2" -eq 1 ] && [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ]; then
     verify_rc=0
     verify_idris2 || verify_rc=$?
     if [ "$verify_rc" -ne 0 ]; then
@@ -176,9 +197,11 @@ fi
 
 if [ "$missing" -eq 0 ]; then
     say ""
-    say "PASS: all three tools present at the pinned versions, and idris2 type-checks"
-    say "      a module that imports Data.Nat AND builds and runs a program."
-    say "      (zig: $(command -v zig), idris2: $(command -v idris2), just: $(command -v just))"
+    say "PASS: every requested tool is present at its pinned version."
+    [ "$WANT_IDRIS2" -eq 1 ] && say "      idris2 type-checks a module importing Data.Nat AND builds and runs a program."
+    [ "$WANT_ZIG" -eq 1 ]    && say "      zig:    $(command -v zig)"
+    [ "$WANT_IDRIS2" -eq 1 ] && say "      idris2: $(command -v idris2)"
+    [ "$WANT_JUST" -eq 1 ]   && say "      just:   $(command -v just)"
     exit 0
 fi
 
@@ -296,10 +319,10 @@ install_idris2() {
     say "    installed $("$PREFIX/bin/idris2" --version | head -1) at $dir/bin/idris2"
 }
 
-[ "$JUST_HAVE" = "$JUST_VERSION" ] || install_just
-[ "$ZIG_HAVE" = "$ZIG_VERSION" ] || install_zig
+[ "$WANT_JUST" -eq 0 ] || [ "$JUST_HAVE" = "$JUST_VERSION" ] || install_just
+[ "$WANT_ZIG" -eq 0 ]  || [ "$ZIG_HAVE" = "$ZIG_VERSION" ]   || install_zig
 # A broken install at the right version is rebuilt too: the version is not the test.
-if [ "$IDRIS2_HAVE" != "$IDRIS2_VERSION" ] || [ "$IDRIS2_BROKEN" -eq 1 ]; then
+if [ "$WANT_IDRIS2" -eq 1 ] && { [ "$IDRIS2_HAVE" != "$IDRIS2_VERSION" ] || [ "$IDRIS2_BROKEN" -eq 1 ]; }; then
     install_idris2
 fi
 
@@ -316,17 +339,26 @@ say ""
 # shape a verification step can take.
 export PATH="$PREFIX/bin:$PATH"
 say "==> verifying the installed toolchain"
-verify_rc=0
-verify_idris2 || verify_rc=$?
-if [ "$verify_rc" -eq 0 ]; then
-    say "    idris2: type-checks a module importing Data.Nat, and builds and runs a program"
-else
-    say "    FAIL: the idris2 just installed does not verify."
-    explain_idris2_failure "$verify_rc"
-    exit 1
+if [ "$WANT_IDRIS2" -eq 1 ]; then
+    verify_rc=0
+    verify_idris2 || verify_rc=$?
+    if [ "$verify_rc" -eq 0 ]; then
+        say "    idris2: type-checks a module importing Data.Nat, and builds and runs a program"
+    else
+        say "    FAIL: the idris2 just installed does not verify."
+        explain_idris2_failure "$verify_rc"
+        exit 1
+    fi
 fi
-say "    zig:    $(zig version) at $(command -v zig)"
-say "    just:   $(just --version) at $(command -v just)"
+# Each requested tool must RUN at its pinned version, not merely exist on PATH.
+if [ "$WANT_ZIG" -eq 1 ]; then
+    [ "$(zig_version)" = "$ZIG_VERSION" ] || { say "    FAIL: zig does not run at $ZIG_VERSION"; exit 1; }
+    say "    zig:    $(zig version) at $(command -v zig)"
+fi
+if [ "$WANT_JUST" -eq 1 ]; then
+    [ "$(just_version)" = "$JUST_VERSION" ] || { say "    FAIL: just does not run at $JUST_VERSION"; exit 1; }
+    say "    just:   $(just --version) at $(command -v just)"
+fi
 
 say "==================================================================="
 say "Add the toolchain to this shell:"
