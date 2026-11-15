@@ -509,6 +509,12 @@ test "the RNG advances and is reproducible" {
 const MIND_CAPS: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT | abi.CAP_DAMAGE_EVENTS;
 const MIND_CAPS_NO_DAMAGE: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT;
 
+/// Every capability ABI 1.1 defined (bits 0..9): what "declare everything" meant to a 1.1
+/// host that set only the bits its header named.
+const CAPS_DEFINED_AT_1_1: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT | abi.CAP_RAYCAST |
+    abi.CAP_WAYPOINT_GRAPH | abi.CAP_SPAWN_RIGHTS | abi.CAP_ANIMATION_HOOKS |
+    abi.CAP_DAMAGE_EVENTS | abi.CAP_SOUND_EVENTS | abi.CAP_VEHICLE_BOARDING | abi.CAP_TERRAIN_HEIGHT;
+
 fn freshMind() abi.EeMind {
     var m = std.mem.zeroes(abi.EeMind);
     m.struct_size = @sizeOf(abi.EeMind);
@@ -733,7 +739,15 @@ test "MIND: a mind held at rest reproduces 1.0's chase trace exactly" {
     // the one input this fixture produces (a contradiction when the memory lapses)
     // cannot cross the startle or hesitation thresholds on its own. So the INTENTS must
     // be 1.0's, tick for tick, and their digest must be the pinned 1.0 chase digest.
-    var ctx = context(0xEE_0000_0000_0001, 0xFFFF_FFFF, 64);
+    //
+    // ABI 1.2 (ADR-0014 §9, a measured surprise): this test declared 0xFFFF_FFFF, every
+    // bit, including bits no capability had at 1.1. Bit 10 is now
+    // EE_CAP_OBSERVATION_CUES, and a host that declares it and never gives a cue tells the
+    // kernel that nobody ever sees the agent — so it stalks, and the digest becomes
+    // 421035655961441872 (measured). The claim of this test is about a mind AT REST, not
+    // about the cue, so it now declares exactly the capabilities 1.1 defined; its pinned
+    // value is unchanged. The 0xFFFF_FFFF arm is pinned below as its own test.
+    var ctx = context(0xEE_0000_0000_0001, CAPS_DEFINED_AT_1_1, 64);
     var ag = agent(0xEE_0000_0000_0001);
     var mind = freshMind();
     var digest: u64 = 0;
@@ -934,4 +948,334 @@ test "MIND: the crowd — every fear input, and both of fear's effects, on one r
     try std.testing.expectEqual(@as(u32, 0), r.unexplained);
     try std.testing.expectEqual(@as(u32, 0), r.uncaused);
     try std.testing.expectEqual(@as(u64, 2365169153326385312), r.digest);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ABI 1.2 — the model of the target's knowledge (ADR-0014). Duplicated in
+// tests/host/null_host.c on purpose: one trace per fixture, checked by digest.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The capabilities of the model fixtures, and of their controls: the one bit that
+/// differs is EE_CAP_OBSERVATION_CUES.
+const MODEL_CAPS: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT | abi.CAP_OBSERVATION_CUES;
+const MODEL_CAPS_NO_CUES: u32 = abi.CAP_NAVMESH | abi.CAP_LINE_OF_SIGHT;
+
+/// How far the target's distance closes per tick at speed 1.0 (the world's one rule).
+const CLOSE_STEP: i32 = 2048;
+/// The tick the target looks at the agent in "caught", and in "false exposure".
+const CAUGHT_TICK: u64 = 100;
+const GLANCE_TICK: u64 = 20;
+
+const ModelFixture = enum { stalker, caught, false_exposure, ambush };
+
+const ModelRun = struct {
+    digest: u64 = 0,
+    first_engage: ?u64 = null, // first tick whose intent is ATTACK
+    caught: u32 = 0, // CAUGHT tells
+    caught_tick: ?u64 = null,
+    first_exposed: ?u64 = null, // first tick the belief closed true
+    exposed_no_cue: u32 = 0, // ticks the belief closed true with no cue that tick
+    exposed_ticks: u32 = 0,
+    stalk_selected: u32 = 0, // ticks whose trace selects the STALK mode
+    stalk_ranked: u32 = 0, // ticks whose ranking contains STALK
+    stalk_after_cue: u32 = 0, // STALK selections after the (first) cue tick
+    first_stalk_after_cue: ?u64 = null,
+    own_attack_changes: u32 = 0, // exposure changes caused by the agent's own attack
+    expiry_tick: ?u64 = null, // the tick the belief expired
+    max_ranking_count: u8 = 0,
+    engage_distance: i32 = 0, // the target's distance on the first engage tick
+    uncaused_exposure: u32 = 0, // exposure changed with NONE, or kept with a cause — must be 0
+    unexplained: u32 = 0, // selected neither first nor incumbent — must be 0
+    tells_mismatch: u32 = 0, // intent tell bits != trace tells — must be 0
+};
+
+/// One snapshot of the model fixtures. One target (id 41) on a fixed bearing.
+fn modelSnapshot(fixture: ModelFixture, t: u64, distance: i32) abi.EeSnapshot {
+    var s = snapshot(t, 7, FX, FX * 3, 0);
+    const cue = switch (fixture) {
+        .stalker, .ambush => false,
+        .caught => t == CAUGHT_TICK,
+        .false_exposure => t == GLANCE_TICK,
+    };
+    const visible = switch (fixture) {
+        .ambush => t < 30, // the ambushed target falls at tick 30 and is gone
+        else => true,
+    };
+    if (visible) {
+        setContact(&s, 0, .{
+            .id = 41,
+            .flags = if (cue) @intCast(abi.CONTACT_FLAG_OBSERVES) else 0,
+            .bearing_cos = 16384,
+            .bearing_sin = 8192,
+            .distance = distance,
+            .threat = FX / 2,
+        });
+        s.contact_count = 1;
+    }
+    return s;
+}
+
+fn cueAt(fixture: ModelFixture, t: u64) bool {
+    return switch (fixture) {
+        .stalker, .ambush => false,
+        .caught => t == CAUGHT_TICK,
+        .false_exposure => t == GLANCE_TICK,
+    };
+}
+
+fn runModel(fixture: ModelFixture, caps: u32, ticks: u64) ModelRun {
+    var ctx = context(0xEE_0000_0000_0001, caps, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var r = ModelRun{};
+    var distance: i32 = switch (fixture) {
+        .ambush => 24576, // inside strike range from the first tick
+        else => 196608, // 3.0: beyond attack range
+    };
+    var first_cue: ?u64 = null;
+    var t: u64 = 0;
+    while (t < ticks) : (t += 1) {
+        const snap = modelSnapshot(fixture, t, distance);
+        const cue = cueAt(fixture, t) and snap.contact_count > 0;
+        if (cue and first_cue == null) first_cue = t;
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        const i = res.intent;
+        const tr = res.model.mind;
+        const m = res.model;
+
+        if (i.action == abi.ACTION_ATTACK and r.first_engage == null) {
+            r.first_engage = t;
+            r.engage_distance = distance;
+        }
+        if (tr.tells & abi.TELL_CAUGHT != 0) {
+            r.caught += 1;
+            if (r.caught_tick == null) r.caught_tick = t;
+        }
+        if (m.exposure == 1) {
+            r.exposed_ticks += 1;
+            if (r.first_exposed == null) r.first_exposed = t;
+            if (!cue) r.exposed_no_cue += 1;
+        }
+        if (tr.selected == abi.AGENT_MODE_STALK) {
+            r.stalk_selected += 1;
+            if (first_cue) |fc| if (t > fc) {
+                r.stalk_after_cue += 1;
+                if (r.first_stalk_after_cue == null) r.first_stalk_after_cue = t;
+            };
+        }
+        var k: u8 = 0;
+        while (k < tr.ranking_count) : (k += 1) {
+            if ((tr.ranking >> @intCast(4 * @as(u32, k))) & 0xF == abi.AGENT_MODE_STALK) r.stalk_ranked += 1;
+        }
+        r.max_ranking_count = @max(r.max_ranking_count, tr.ranking_count);
+        if (m.exposure_cause == abi.EXPOSURE_CAUSE_OWN_ATTACK) r.own_attack_changes += 1;
+        if (m.exposure_cause == abi.EXPOSURE_CAUSE_EXPIRY and r.expiry_tick == null) r.expiry_tick = t;
+        if ((m.exposure != m.exposure_prev) != (m.exposure_cause != abi.EXPOSURE_CAUSE_NONE)) r.uncaused_exposure += 1;
+        const first: u32 = tr.ranking & 0xF;
+        if (tr.selected != first and tr.selected != tr.incumbent) r.unexplained += 1;
+        if ((i.flags >> 4) & 0xF != tr.tells) r.tells_mismatch += 1;
+
+        r.digest = r.digest *% 1099511628211 +% i.action;
+        r.digest = r.digest *% 1099511628211 +% i.target_id;
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_y)));
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.look_x)));
+        r.digest = r.digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.speed)));
+        r.digest = r.digest *% 1099511628211 +% i.priority;
+        r.digest = r.digest *% 1099511628211 +% i.flags;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking;
+        r.digest = r.digest *% 1099511628211 +% tr.ranking_count;
+        r.digest = r.digest *% 1099511628211 +% tr.selected;
+        r.digest = r.digest *% 1099511628211 +% tr.incumbent;
+        r.digest = r.digest *% 1099511628211 +% tr.token;
+        r.digest = r.digest *% 1099511628211 +% tr.cause;
+        r.digest = r.digest *% 1099511628211 +% tr.tells;
+        r.digest = r.digest *% 1099511628211 +% m.exposure;
+        r.digest = r.digest *% 1099511628211 +% m.exposure_prev;
+        r.digest = r.digest *% 1099511628211 +% m.exposure_cause;
+        r.digest = r.digest *% 1099511628211 +% m.exposure_contact;
+
+        // The world: the range closes while the agent moves toward the target. In
+        // "false exposure" the target keeps its distance (it walks off as the agent
+        // comes on), so the only thing that changes is what the agent believes.
+        if (fixture != .false_exposure and (i.action == abi.ACTION_ADVANCE or i.action == abi.ACTION_TAKE_COVER)) {
+            distance -= kernel.fxMul(i.speed, CLOSE_STEP);
+            if (distance < 0) distance = 0;
+        }
+    }
+    return r;
+}
+
+fn printModel(name: []const u8, r: ModelRun) void {
+    std.debug.print(
+        "MODEL {s}: digest={d} first_engage={?d} at={d} caught={d}@{?d} first_exposed={?d} exposed={d} exposed_no_cue={d} stalk_selected={d} stalk_ranked={d} stalk_after_cue={d} first_stalk_after_cue={?d} own_attack={d} expiry={?d} max_rank={d} uncaused={d} unexplained={d} tells_mismatch={d}\n",
+        .{ name, r.digest, r.first_engage, r.engage_distance, r.caught, r.caught_tick, r.first_exposed, r.exposed_ticks, r.exposed_no_cue, r.stalk_selected, r.stalk_ranked, r.stalk_after_cue, r.first_stalk_after_cue, r.own_attack_changes, r.expiry_tick, r.max_ranking_count, r.uncaused_exposure, r.unexplained, r.tells_mismatch },
+    );
+}
+
+// MEASURED on 2026-11-14, both arms of each pair, before any number below was pinned.
+// Each control differs from its fixture in ONE input: EE_CAP_OBSERVATION_CUES is not
+// declared. The snapshots are byte-identical, cue bit included, so "without the
+// capability the kernel ignores the bit" is checked, not assumed: "caught"'s control
+// has the cue on tick 100 and gets the stalker control's digest exactly.
+
+fn expectModelInvariants(r: ModelRun) !void {
+    try std.testing.expectEqual(@as(u32, 0), r.uncaused_exposure);
+    try std.testing.expectEqual(@as(u32, 0), r.unexplained);
+    try std.testing.expectEqual(@as(u32, 0), r.tells_mismatch);
+}
+
+fn expectOneOne(r: ModelRun) !void {
+    // A control is ABI 1.1: no exposure, no stalk in any ranking, five candidates at most.
+    try std.testing.expectEqual(@as(u32, 0), r.exposed_ticks);
+    try std.testing.expectEqual(@as(u32, 0), r.stalk_ranked);
+    try std.testing.expectEqual(@as(u32, 0), r.caught);
+    try std.testing.expect(r.max_ranking_count <= 5);
+}
+
+test "MODEL: the stalker engages only inside strike range; its control engages earlier" {
+    const r = runModel(.stalker, MODEL_CAPS, 200);
+    const c = runModel(.stalker, MODEL_CAPS_NO_CUES, 200);
+    printModel("stalker", r);
+    printModel("stalker-control", c);
+    try std.testing.expectEqual(@as(?u64, 160), r.first_engage);
+    try std.testing.expectEqual(@as(i32, 32768), r.engage_distance); // STRIKE_RANGE
+    try std.testing.expectEqual(@as(u32, 160), r.stalk_selected); // every tick before it
+    try std.testing.expectEqual(@as(u32, 1), r.own_attack_changes); // the strike revealed it
+    try std.testing.expectEqual(@as(?u64, 160), r.first_exposed);
+    try std.testing.expectEqual(@as(u8, 6), r.max_ranking_count);
+    try std.testing.expectEqual(@as(?u64, 64), c.first_engage);
+    try std.testing.expectEqual(@as(i32, 65536), c.engage_distance); // ATTACK_RANGE
+    try expectOneOne(c);
+    try expectModelInvariants(r);
+    try expectModelInvariants(c);
+    try std.testing.expectEqual(@as(u64, 5067313941334346860), r.digest);
+    try std.testing.expectEqual(@as(u64, 5359463348611598049), c.digest);
+}
+
+test "MODEL: caught — one CAUGHT tell on the cue tick, exposed from it, and no more stalking" {
+    const r = runModel(.caught, MODEL_CAPS, 200);
+    const c = runModel(.caught, MODEL_CAPS_NO_CUES, 200);
+    printModel("caught", r);
+    printModel("caught-control", c);
+    try std.testing.expectEqual(@as(u32, 1), r.caught);
+    try std.testing.expectEqual(@as(?u64, CAUGHT_TICK), r.caught_tick);
+    try std.testing.expectEqual(@as(?u64, CAUGHT_TICK), r.first_exposed);
+    try std.testing.expectEqual(@as(u32, 200 - CAUGHT_TICK), r.exposed_ticks); // true from that tick on
+    try std.testing.expectEqual(@as(u32, 100), r.stalk_selected); // ticks 0..99 only
+    try std.testing.expectEqual(@as(u32, 0), r.stalk_after_cue);
+    try std.testing.expectEqual(@as(?u64, 115), r.first_engage); // exposed: 1.1's attack range
+    try expectOneOne(c);
+    try expectModelInvariants(r);
+    try expectModelInvariants(c);
+    try std.testing.expectEqual(@as(u64, 3395485040061069912), r.digest);
+    // The cue bit without the capability is ignored: the stalker control's digest exactly.
+    try std.testing.expectEqual(@as(u64, 5359463348611598049), c.digest);
+}
+
+test "MODEL: false exposure — the belief outlives the gaze by exactly its lifetime" {
+    const r = runModel(.false_exposure, MODEL_CAPS, 200);
+    const c = runModel(.false_exposure, MODEL_CAPS_NO_CUES, 200);
+    printModel("false-exposure", r);
+    printModel("false-exposure-control", c);
+    try std.testing.expectEqual(@as(u32, 90), r.exposed_no_cue); // EXPOSURE_TTL
+    try std.testing.expectEqual(@as(u32, 0), c.exposed_no_cue);
+    try std.testing.expectEqual(@as(?u64, GLANCE_TICK + 90 + 1), r.expiry_tick);
+    try std.testing.expectEqual(@as(?u64, GLANCE_TICK + 90 + 1), r.first_stalk_after_cue);
+    try std.testing.expectEqual(@as(u32, 1), r.caught); // it was stalking when glanced at
+    try expectOneOne(c);
+    try expectModelInvariants(r);
+    try expectModelInvariants(c);
+    try std.testing.expectEqual(@as(u64, 11105738738098638480), r.digest);
+    try std.testing.expectEqual(@as(u64, 11366903142131820018), c.digest);
+}
+
+test "MODEL: the ambush — the agent's own attack sets exposure, and the belief then expires" {
+    const r = runModel(.ambush, MODEL_CAPS, 200);
+    const c = runModel(.ambush, MODEL_CAPS_NO_CUES, 200);
+    printModel("ambush", r);
+    printModel("ambush-control", c);
+    try std.testing.expectEqual(@as(?u64, 0), r.first_engage);
+    try std.testing.expectEqual(@as(?u64, 0), r.first_exposed); // set by the strike, no cue anywhere
+    try std.testing.expectEqual(@as(u32, 1), r.own_attack_changes);
+    try std.testing.expectEqual(@as(?u64, 30 + 90), r.expiry_tick); // last strike 29, then the lifetime
+    try std.testing.expectEqual(@as(u32, 120), r.exposed_no_cue);
+    try expectOneOne(c);
+    try expectModelInvariants(r);
+    try expectModelInvariants(c);
+    try std.testing.expectEqual(@as(u64, 1370696199260345134), r.digest);
+    try std.testing.expectEqual(@as(u64, 10128845661911672413), c.digest);
+}
+
+test "MODEL: a host that declares every bit and never cues — false concealment, pinned" {
+    // The measured surprise of ADR-0014 §9, as its own pin: 1.1's chase-at-rest fixture
+    // with 0xFFFF_FFFF, which now includes EE_CAP_OBSERVATION_CUES. Nobody ever observes
+    // the agent, so it stalks the visible contact instead of advancing on it.
+    var ctx = context(0xEE_0000_0000_0001, 0xFFFF_FFFF, 64);
+    var ag = agent(0xEE_0000_0000_0001);
+    var mind = freshMind();
+    var digest: u64 = 0;
+    var stalks: u32 = 0;
+    var t: u64 = 0;
+    while (t < 10_000) : (t += 1) {
+        const snap = chaseSnapshot(t, (t % 100) < 30);
+        var res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        kernel.degradeForCapabilities(&ctx, &res.intent);
+        mind.arousal = 0;
+        mind.fear = 0;
+        mind.grievance = 0;
+        const i = res.intent;
+        if (i.action == abi.ACTION_TAKE_COVER) stalks += 1;
+        digest = digest *% 1099511628211 +% i.action;
+        digest = digest *% 1099511628211 +% i.target_id;
+        digest = digest *% 1099511628211 +% @as(u64, @bitCast(@as(i64, i.move_x)));
+        digest = digest *% 1099511628211 +% i.flags;
+    }
+    std.debug.print("MODEL all-bits chase: digest={d} stalks={d}\n", .{ digest, stalks });
+    try std.testing.expect(stalks > 0);
+    try std.testing.expectEqual(@as(u64, 421035655961441872), digest);
+}
+
+test "MODEL: without the capability no exposure bit is read or written, even if set" {
+    // A host that wrote garbage into ee_agent.flags bits 4..15 and declared nothing: the
+    // kernel leaves those bits alone and reports no exposure.
+    var ctx = context(1, MODEL_CAPS_NO_CUES, 64);
+    var ag = agent(1);
+    ag.flags = abi.AGENT_FLAG_EXPOSED | abi.AGENT_EXPOSURE_MASK;
+    var mind = freshMind();
+    var t: u64 = 0;
+    while (t < 50) : (t += 1) {
+        var snap = modelSnapshot(.caught, t, 100000);
+        snap.contact0.flags = @intCast(abi.CONTACT_FLAG_OBSERVES);
+        const res = kernel.tickMind(&ctx, &snap, &ag, &mind);
+        try std.testing.expectEqual(@as(u8, 0), res.model.exposure);
+        try std.testing.expectEqual(@as(u8, 0), res.model.exposure_cause);
+        try std.testing.expect(res.trace.tells & abi.TELL_CAUGHT == 0);
+        try std.testing.expectEqual(abi.AGENT_FLAG_EXPOSED | abi.AGENT_EXPOSURE_MASK, ag.flags & (abi.AGENT_FLAG_EXPOSED | abi.AGENT_EXPOSURE_MASK));
+    }
+}
+
+test "MODEL: the lifetime is bounded, even from garbage, and a mode write cannot touch it" {
+    var e = kernel.readExposure(&.{ .rng_state = 0, .tick_last = 0, .memory_x = 0, .memory_y = 0, .memory_age = 0, .cached_action = 0, .cached_target = 0, .budget_used = 0, .degraded_ticks = 0, .flags = 0xFFFF_FFFF });
+    try std.testing.expect(e.exposed);
+    try std.testing.expect(e.left <= 90);
+    var quiet: u32 = 0;
+    while (true) {
+        const st = kernel.stepExposure(e, false, false);
+        if (!st.exposed) {
+            try std.testing.expectEqual(@as(u8, @intCast(abi.EXPOSURE_CAUSE_EXPIRY)), st.cause);
+            break;
+        }
+        try std.testing.expectEqual(@as(u8, @intCast(abi.EXPOSURE_CAUSE_NONE)), st.cause);
+        quiet += 1;
+        e = .{ .exposed = st.exposed, .left = st.left };
+    }
+    try std.testing.expectEqual(@as(u32, 90), quiet);
+    var ag = agent(1);
+    ag.flags = abi.AGENT_FLAG_EXPOSED | (17 << 8);
+    kernel.setMode(&ag, abi.AGENT_MODE_STALK);
+    kernel.setMode(&ag, abi.AGENT_MODE_INVESTIGATE);
+    try std.testing.expectEqual(@as(u8, 17), kernel.readExposure(&ag).left);
+    try std.testing.expect(kernel.readExposure(&ag).exposed);
 }

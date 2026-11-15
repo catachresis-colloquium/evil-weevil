@@ -623,6 +623,27 @@ const FEAR_EVADE_SHIFT: u5 = 4; // evade score + fear / 16: at most +4096, below
 const FEAR_WOUND_SHIFT: u5 = 2;
 const GRIEVANCE_MARGIN_SHIFT: u5 = 2; // pursuit margin + grievance / 4: at most +16384
 
+// ── ABI 1.2: the model of the target's knowledge (ADR-0014, `Abi/Exposure.idr`) ──
+// Exposure — "T knows where I am" — is a BELIEF, so only EVIDENCE writes it: the host's
+// cue (`EE_CONTACT_FLAG_OBSERVES`) or the agent's own attack. No reservoir is an argument
+// to any function below that writes it. Every constant here is policy, not ABI, and each
+// one moves at least one pinned digest when changed (ADR-0014 §8).
+//
+// Without `EE_CAP_OBSERVATION_CUES` none of this runs: the exposure bits are neither read
+// nor written, stalk is not a candidate, and `tickMind` is the 1.1 function.
+
+/// Ticks the belief outlives its last evidence. A COUNTER, not a leak: ADR-0013 §3
+/// found that a floored leak never drains, so a lifetime is counted down and ends.
+const EXPOSURE_TTL: u8 = 90; // 1.5 s at 60 Hz: a guard stays guarded that long after a gaze
+/// Unseen, the agent engages only this close; between here and ATTACK_RANGE it stalks.
+const STRIKE_RANGE: i32 = 32768; // 0.5
+/// Stalk's weight: above engage (52428), so concealment defers the strike; below flee
+/// (58982), so a wounded agent still runs before it starts a stalk; and with the 1.0 margin
+/// (+8192 = 63897) still below reload (65536), so a stalker always reloads.
+const UTILITY_STALK: u32 = 55705; // 0.85
+/// A stalker closes the range at half pace, in cover.
+const STALK_SPEED: i32 = 32768; // 0.5
+
 /// Ceil(x / 2^k) for x > 0, and 0 for 0 — the leak. Rounding UP is what makes a
 /// reservoir with no input reach zero: the brief's `x >> k` floors, and a floored leak
 /// stalls forever at any x < 2^k (a grievance of 255 would widen the margin for the
@@ -764,11 +785,27 @@ fn wasSeen(mind: *const abi.EeMind, id: u16) bool {
 /// A lead the INVESTIGATE candidate can follow: the grudge slot or the 1.0 memory.
 const Lead = struct { id: u32, x: i32, y: i32 };
 
+/// The mode an action belongs to, in the mind. 1.0's `modeForAction` for every action
+/// 1.1 produces; TAKE_COVER — which only the stalk candidate produces, and only under
+/// `EE_CAP_OBSERVATION_CUES` — is the STALK mode (code 5).
+pub fn mindModeForAction(action: u32) u32 {
+    return if (action == abi.ACTION_TAKE_COVER) abi.AGENT_MODE_STALK else modeForAction(action);
+}
+
+/// The stalk candidate's score: concealed (`stalk_ok`), with the target beyond strike
+/// range. Inside strike range it scores zero, so engage takes over — and a stalking
+/// incumbent's margin cannot hold it, because 0 + 8192 loses to 52428.
+fn stalkUtility(near: ?Nearest, stalk_ok: bool) u32 {
+    const n = near orelse return 0;
+    return if (stalk_ok and n.distance > STRIKE_RANGE) UTILITY_STALK else 0;
+}
+
 /// One mode candidate's score in the mind. Equal to the 1.0 `utilityOf` when fear is
 /// zero and the lead is exactly 1.0's (nothing visible, memory fresh) — which is the
 /// whole of the mind's footprint on the graph when it is calm and holds no grudge.
-fn mindUtility(action: u32, snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32) u32 {
+fn mindUtility(action: u32, snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32, stalk_ok: bool) u32 {
     return switch (action) {
+        abi.ACTION_TAKE_COVER => stalkUtility(near, stalk_ok),
         abi.ACTION_RELOAD => if (snap.ammo == 0) UTILITY_RELOAD else 0,
         abi.ACTION_FLEE => if (near) |n|
             (if (snap.health < woundedBelow(fear) and n.distance < FLEE_RANGE)
@@ -797,22 +834,36 @@ pub fn woundedBelow(fear: u32) i32 {
     return WOUNDED_BELOW + @as(i32, @intCast(@min(fear, FULL) >> FEAR_WOUND_SHIFT));
 }
 
-fn mindCandidates(near: ?Nearest, lead: ?Lead) []const u32 {
+fn mindCandidates(near: ?Nearest, lead: ?Lead, stalk_ok: bool) []const u32 {
     if (near == null and lead != null) return &[_]u32{abi.ACTION_INVESTIGATE};
+    // Stalk is appended, last in tie-break order: with `stalk_ok` false the list is 1.1's
+    // exactly, which is the whole of "with exposure true the ranking is 1.1's".
+    if (stalk_ok and near != null) return &STALK_CANDIDATES;
     return &CANDIDATES;
 }
+
+/// 1.1's candidates with stalk (TAKE_COVER) appended before HOLD.
+const STALK_CANDIDATES = [_]u32{
+    abi.ACTION_RELOAD,
+    abi.ACTION_FLEE,
+    abi.ACTION_ATTACK,
+    abi.ACTION_INVESTIGATE,
+    abi.ACTION_ADVANCE,
+    abi.ACTION_TAKE_COVER,
+    abi.ACTION_HOLD,
+};
 
 /// The ranking: mode candidates by score, highest first, ties in candidate order.
 /// HOLD is not a mode and is not ranked (`enaction-mind-trace/1` candidates are modes).
 const Ranking = struct { packed_modes: u32, count: u8, first: u32 };
 
-fn rankModes(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32) Ranking {
-    var modes: [5]u32 = undefined;
-    var scores: [5]u32 = undefined;
+fn rankModes(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32, stalk_ok: bool) Ranking {
+    var modes: [6]u32 = undefined;
+    var scores: [6]u32 = undefined;
     var n: usize = 0;
-    for (mindCandidates(near, lead)) |a| {
+    for (mindCandidates(near, lead, stalk_ok)) |a| {
         if (a == abi.ACTION_HOLD) continue;
-        const sc = mindUtility(a, snap, near, lead, fear);
+        const sc = mindUtility(a, snap, near, lead, fear, stalk_ok);
         // Stable insertion: a later candidate passes an earlier one only if STRICTLY
         // greater, so equal scores stay in candidate order.
         var j: usize = n;
@@ -820,7 +871,7 @@ fn rankModes(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32
             modes[j] = modes[j - 1];
             scores[j] = scores[j - 1];
         }
-        modes[j] = modeForAction(a);
+        modes[j] = mindModeForAction(a);
         scores[j] = sc;
         n += 1;
     }
@@ -829,12 +880,12 @@ fn rankModes(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32
     return .{ .packed_modes = p, .count = @intCast(n), .first = modes[0] };
 }
 
-fn chooseMind(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32, incumbent: u32, margin: u32) u32 {
+fn chooseMind(snap: *const abi.EeSnapshot, near: ?Nearest, lead: ?Lead, fear: u32, incumbent: u32, margin: u32, stalk_ok: bool) u32 {
     var best_action: u32 = abi.ACTION_HOLD;
     var best_score: u32 = 0;
-    for (mindCandidates(near, lead)) |a| {
-        var sc = mindUtility(a, snap, near, lead, fear);
-        if (modeForAction(a) == incumbent) sc += margin;
+    for (mindCandidates(near, lead, stalk_ok)) |a| {
+        var sc = mindUtility(a, snap, near, lead, fear, stalk_ok);
+        if (mindModeForAction(a) == incumbent) sc += margin;
         if (sc > best_score) {
             best_score = sc;
             best_action = a;
@@ -857,6 +908,11 @@ fn mindDecision(action: u32, near: ?Nearest, lead: ?Lead) Decision {
         abi.ACTION_INVESTIGATE => blk: {
             const l = lead.?;
             break :blk .{ .action = action, .target = l.id, .priority = UTILITY_INVESTIGATE, .speed = abi.FX_ONE, .move_x = l.x, .move_y = l.y, .look_x = l.x, .look_y = l.y };
+        },
+        // Stalk: in cover, toward the target, at half pace, watching it.
+        abi.ACTION_TAKE_COVER => blk: {
+            const n = near.?;
+            break :blk .{ .action = action, .target = n.id, .priority = UTILITY_STALK, .speed = STALK_SPEED, .move_x = n.bearing_cos, .move_y = n.bearing_sin, .look_x = n.bearing_cos, .look_y = n.bearing_sin };
         },
         abi.ACTION_ADVANCE => if (near) |n|
             .{ .action = action, .target = n.id, .priority = UTILITY_ADVANCE, .speed = abi.FX_ONE, .move_x = n.bearing_cos, .move_y = n.bearing_sin, .look_x = n.bearing_cos, .look_y = n.bearing_sin }
@@ -891,8 +947,47 @@ fn forgetGrudgeLead(mind: *abi.EeMind) void {
     mind.grudge_age = 0;
 }
 
-/// What one mind tick produced, besides the writes into the caller-owned structs.
-pub const MindResult = struct { intent: abi.EeIntent, trace: abi.EeMindTrace };
+/// The exposure belief as one tick opens: the flag, and the lifetime it still has. The
+/// counter means something only while the flag is set, and is clamped against garbage.
+pub const Exposure = struct { exposed: bool, left: u8 };
+
+pub fn readExposure(agent: *const abi.EeAgent) Exposure {
+    const exposed = (agent.flags & abi.AGENT_FLAG_EXPOSED) != 0;
+    const raw: u32 = (agent.flags & abi.AGENT_EXPOSURE_MASK) >> @intCast(abi.AGENT_EXPOSURE_SHIFT);
+    return .{ .exposed = exposed, .left = if (!exposed) 0 else @intCast(@min(raw, EXPOSURE_TTL)) };
+}
+
+fn writeExposure(agent: *abi.EeAgent, e: Exposure) void {
+    var f = agent.flags & ~(abi.AGENT_FLAG_EXPOSED | abi.AGENT_EXPOSURE_MASK);
+    if (e.exposed) f |= abi.AGENT_FLAG_EXPOSED;
+    f |= (@as(u32, e.left) << @intCast(abi.AGENT_EXPOSURE_SHIFT)) & abi.AGENT_EXPOSURE_MASK;
+    agent.flags = f;
+}
+
+/// One step of the belief — the kernel's `Abi.Exposure.exposedAfter`/`leftAfter`/`causeOf`.
+/// Evidence is a cue or the agent's own attack; without either, a live belief counts down
+/// and, at zero, expires. Nothing else is an argument: no reservoir, no score.
+pub const ExposureStep = struct { exposed: bool, left: u8, cause: u8 };
+
+pub fn stepExposure(e: Exposure, cue: bool, attacked: bool) ExposureStep {
+    const live = e.exposed and e.left > 0;
+    const now = cue or attacked or live;
+    const left: u8 = if (cue or attacked) EXPOSURE_TTL else if (live) e.left - 1 else 0;
+    const cause: u8 = if (now == e.exposed)
+        @intCast(abi.EXPOSURE_CAUSE_NONE)
+    else if (cue)
+        @intCast(abi.EXPOSURE_CAUSE_CUE)
+    else if (attacked)
+        @intCast(abi.EXPOSURE_CAUSE_OWN_ATTACK)
+    else
+        @intCast(abi.EXPOSURE_CAUSE_EXPIRY);
+    return .{ .exposed = now, .left = left, .cause = cause };
+}
+
+/// What one mind tick produced, besides the writes into the caller-owned structs. `model`
+/// is the 1.2 record (its `mind` member equal to `trace`); `ee_tick_mind` writes it only
+/// when the host's trace declares the 1.2 size.
+pub const MindResult = struct { intent: abi.EeIntent, trace: abi.EeMindTrace, model: abi.EeModelTrace };
 
 /// One tick with a mind. Pure in the same sense as `tick`: a function of (context,
 /// snapshot, agent, mind), writing only into the agent and the mind the caller owns.
@@ -919,6 +1014,24 @@ pub fn tickMind(
     const grievance0 = @min(mind.grievance, FULL);
     const token0: u8 = if (mind.token > abi.AFFECT_ANGRY) @intCast(abi.AFFECT_CALM) else mind.token;
     const ttl = ttlFor(arousal0); // attention: how long a lead is followed
+
+    // ── The model (ABI 1.2): what this tick's evidence says the target knows ─────
+    // Read and written only under the capability; without it the belief is false and
+    // no exposure bit of `agent.flags` is touched, so a 1.1 host gets 1.1 exactly.
+    const cues_on = hasCapability(ctx, abi.CAP_OBSERVATION_CUES);
+    const ex0: Exposure = if (cues_on) readExposure(agent) else .{ .exposed = false, .left = 0 };
+    var observer: ?abi.EeContact = null; // the first contact, in published order, that observes
+    if (cues_on) {
+        for (contacts[0..count]) |c| {
+            if ((c.flags & abi.CONTACT_FLAG_OBSERVES) != 0) {
+                observer = c;
+                break;
+            }
+        }
+    }
+    // The belief the DECISION uses: a cue now, or a belief still alive. The agent's own
+    // attack is evidence too, but it is this tick's act, so it counts from the next.
+    const exposed_now = observer != null or (ex0.exposed and ex0.left > 0);
 
     // ── Appraisal: what this tick's snapshot means, as inputs ─────────────────
     var in = Inputs{};
@@ -1014,6 +1127,11 @@ pub fn tickMind(
     const cause = causeFor(token0, token, in);
     const attention = massOf(@max(arousal, @max(fear, grievance)));
 
+    // Stalk needs the capability, a visible target, a belief of concealment, and a token
+    // that is not afraid: fear removes the candidate (affect buys attention: it can take a
+    // candidate away, it cannot make the agent believe it is unseen).
+    const stalk_ok = cues_on and !exposed_now and near != null and token != abi.AFFECT_AFRAID;
+
     // ── Perception of the grudge target, BEFORE the decision ───────────────────
     // A sighting is perception, so it is current: the lead the agent hunts with is
     // the bearing it sees now if it sees the target at all.
@@ -1047,8 +1165,8 @@ pub fn tickMind(
     const pursuing = incumbent == abi.AGENT_MODE_INVESTIGATE and grievance > 0 and
         agent.cached_target == grudge_id;
     const margin = mindMargin(pursuing, grievance);
-    const action = chooseMind(snap, near, lead, fear, incumbent, margin);
-    const ranking = rankModes(snap, near, lead, fear);
+    const action = chooseMind(snap, near, lead, fear, incumbent, margin, stalk_ok);
+    const ranking = rankModes(snap, near, lead, fear, stalk_ok);
     const d = mindDecision(action, near, lead);
 
     // ── The body: tells change the motor output, never the decision ────────────
@@ -1063,16 +1181,26 @@ pub fn tickMind(
 
     const startle = arousal0 < STARTLE_AROUSAL and arousal >= STARTLE_AROUSAL and
         (in.close_contact > 0 or in.contradiction > 0);
-    if (startle) {
-        tells |= @intCast(abi.TELL_STARTLE);
+    // CAUGHT: the cue arrives while the agent stalks, unexposed as the tick opened. One
+    // tick of freeze, like a startle; the decision above was already made as exposed.
+    const caught = observer != null and !ex0.exposed and incumbent == abi.AGENT_MODE_STALK;
+    if (startle or caught) {
+        if (startle) tells |= @intCast(abi.TELL_STARTLE);
+        if (caught) tells |= @intCast(abi.TELL_CAUGHT);
         acts = false;
         out_action = abi.ACTION_HOLD;
         speed = 0;
         move_x = 0;
         move_y = 0;
-        if (surprise) |s| {
-            look_x = s.bearing_cos; // the look snaps to what startled it
-            look_y = s.bearing_sin;
+        if (startle) {
+            if (surprise) |s| {
+                look_x = s.bearing_cos; // the look snaps to what startled it
+                look_y = s.bearing_sin;
+            }
+        }
+        if (caught) {
+            look_x = observer.?.bearing_cos; // ...or to the eyes that caught it
+            look_y = observer.?.bearing_sin;
         }
     } else {
         const is_new = d.action != agent.cached_action;
@@ -1099,6 +1227,27 @@ pub fn tickMind(
         look_x = mind.grudge_x;
         look_y = mind.grudge_y;
     }
+
+    // Stalk without a navmesh keeps to its cover: the ADR-0004 ladder, as for ADVANCE.
+    // (Only stalk produces TAKE_COVER, and only under the capability.)
+    var stalk_unreachable = false;
+    if (out_action == abi.ACTION_TAKE_COVER and !hasCapability(ctx, abi.CAP_NAVMESH)) {
+        speed = 0;
+        move_x = 0;
+        move_y = 0;
+        stalk_unreachable = true;
+    }
+
+    // ── The model's bookkeeping: evidence writes the belief, and nothing else does ─
+    // An attack reveals the attacker — but only one the body actually made.
+    const attacked = cues_on and acts and out_action == abi.ACTION_ATTACK;
+    const ex1 = stepExposure(ex0, observer != null, attacked);
+    if (cues_on) writeExposure(agent, .{ .exposed = ex1.exposed, .left = ex1.left });
+    const exposure_contact: u16 = switch (ex1.cause) {
+        abi.EXPOSURE_CAUSE_CUE => observer.?.id,
+        abi.EXPOSURE_CAUSE_OWN_ATTACK => @truncate(d.target),
+        else => 0,
+    };
 
     // ── Bookkeeping: perception writes memory; affect only set its lifetime ─────
     if (near) |n| {
@@ -1135,11 +1284,12 @@ pub fn tickMind(
     if (degraded) flags |= abi.INTENT_FLAG_DEGRADED;
     if (agent.cached_target != d.target) flags |= abi.INTENT_FLAG_NEW_TARGET;
     if (out_action == abi.ACTION_INVESTIGATE) flags |= abi.INTENT_FLAG_FROM_MEMORY;
+    if (stalk_unreachable) flags |= abi.INTENT_FLAG_UNREACHABLE;
     flags |= @as(u32, tells) << 4;
 
     agent.tick_last = snap.tick;
     if (acts) {
-        setMode(agent, modeForAction(d.action));
+        setMode(agent, mindModeForAction(d.action));
         agent.cached_action = d.action;
         agent.cached_target = d.target;
     }
@@ -1147,6 +1297,25 @@ pub fn tickMind(
     if (degraded) agent.degraded_ticks +%= 1;
     ctx.ticks_run +%= 1;
     if (degraded) ctx.degraded_ticks +%= 1;
+
+    const trace = abi.EeMindTrace{
+        .struct_size = @sizeOf(abi.EeMindTrace),
+        .target_id = d.target,
+        .tick = snap.tick,
+        .ranking = ranking.packed_modes,
+        .attention = attention,
+        .cause_contact = cause.contact,
+        .ranking_count = ranking.count,
+        .selected = @intCast(mindModeForAction(d.action)),
+        .incumbent = @intCast(incumbent),
+        .token = token,
+        .token_prev = token0,
+        .cause = cause.code,
+        .tells = tells,
+        .reserved0 = 0,
+    };
+    var model_mind = trace;
+    model_mind.struct_size = @sizeOf(abi.EeModelTrace);
 
     return .{
         .intent = .{
@@ -1163,21 +1332,15 @@ pub fn tickMind(
             .flags = flags,
             .reserved0 = 0,
         },
-        .trace = .{
-            .struct_size = @sizeOf(abi.EeMindTrace),
-            .target_id = d.target,
-            .tick = snap.tick,
-            .ranking = ranking.packed_modes,
-            .attention = attention,
-            .cause_contact = cause.contact,
-            .ranking_count = ranking.count,
-            .selected = @intCast(modeForAction(d.action)),
-            .incumbent = @intCast(incumbent),
-            .token = token,
-            .token_prev = token0,
-            .cause = cause.code,
-            .tells = tells,
+        .trace = trace,
+        .model = .{
+            .mind = model_mind,
+            .exposure_contact = exposure_contact,
+            .exposure = @intFromBool(ex1.exposed),
+            .exposure_prev = @intFromBool(ex0.exposed),
+            .exposure_cause = ex1.cause,
             .reserved0 = 0,
+            .reserved1 = 0,
         },
     };
 }

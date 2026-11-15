@@ -376,6 +376,39 @@ mindTraceFieldsAligned : ( (8 `mod` 8) = 0, (20 `mod` 2) = 0, (22 `mod` 2) = 0 )
 mindTraceFieldsAligned = (Refl, Refl, Refl)
 
 --------------------------------------------------------------------------------
+-- ee_model_trace (ABI 1.2, ADR-0014): the 1.1 trace as its first member, then the model
+--------------------------------------------------------------------------------
+
+||| The 1.1 record occupies [0, 32) and the model's fields follow it with no gap.
+export
+modelTraceOffsets : offsetsOf [32, 2, 1, 1, 1, 1, 2] = [0, 32, 34, 35, 36, 37, 38]
+modelTraceOffsets = Refl
+
+export
+modelTraceSize : totalOf [32, 2, 1, 1, 1, 1, 2] = 40
+modelTraceSize = Refl
+
+export
+modelTraceSizeAligned : (40 `mod` 8) = 0
+modelTraceSizeAligned = Refl
+
+||| THE 1.1 RECORD IS A PREFIX: the first member's size is exactly the 1.1 trace's
+||| size, and it sits at offset 0, so `struct_size` — the 1.1 record's first field — is
+||| at offset 0 of the 1.2 record too. That is what lets `ee_tick_mind` read one field to
+||| learn which record it was handed, and what keeps a 1.1 host's 32-byte buffer safe.
+export
+mindTraceIsThePrefix :
+  ( sizeAt 0 [32, 2, 1, 1, 1, 1, 2] = totalOf [4, 4, 8, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]
+  , offsetAt 0 [32, 2, 1, 1, 1, 1, 2] = 0 )
+mindTraceIsThePrefix = (Refl, Refl)
+
+||| The embedded record starts on an 8-byte boundary (its `tick` is a u64), and the
+||| model's u16 fields on 2-byte boundaries.
+export
+modelTraceFieldsAligned : ( (0 `mod` 8) = 0, (32 `mod` 2) = 0, (38 `mod` 2) = 0 )
+modelTraceFieldsAligned = (Refl, Refl, Refl)
+
+--------------------------------------------------------------------------------
 -- Cross-struct facts
 --------------------------------------------------------------------------------
 
@@ -393,3 +426,9 @@ allStructSizesAligned : ( (8 `mod` 8) = 0
                         , (56 `mod` 8) = 0
                         , (32 `mod` 8) = 0 )
 allStructSizesAligned = (Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl, Refl)
+
+||| ABI 1.2: the one struct it adds keeps the rule (40 is a multiple of 8). A separate
+||| theorem, so the nine-struct statement above is unchanged.
+export
+modelStructSizeAligned : (40 `mod` 8) = 0
+modelStructSizeAligned = Refl
