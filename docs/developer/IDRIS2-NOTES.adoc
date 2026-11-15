@@ -108,3 +108,40 @@ type` — which reads like a malformed type, not a missing import. Import
   theorem needs order lemmas.
 * No `Integral Nat`, no `exit`/`mapM_` in base `System` (affects programs, not
   proofs — `Abi.Gen` is a program and lives accordingly).
+
+== 9. A half-installed Idris2 type-checks, then cannot build a program (and exits 0)
+
+Measured 2026-11-15 against the pinned 0.7.0 built from the `v0.7.0` git tag.
+
+*What failed.* From 2026-10-01 until PR #10, CI's `just proof-check-idris2`
+passed and `just seam-check` died at its first step:
+
+[source]
+----
+Error: INTERNAL ERROR: Can't find data file chez/support.ss in any of [...]
+----
+
+*Cause (as established by PR #10, and reproduced here).* The binary looks for
+its libraries and its backend support files under the prefix that was compiled
+into it by `make bootstrap`. `scripts/install-toolchain.sh` used to give `PREFIX`
+to `make install` only, so the binary kept the default `~/.idris2` while the
+support files went to the install prefix. Type-checking needs only the libraries;
+building an executable also needs `support/chez/support.ss` and
+`libidris2_support.so`. Hence a toolchain that passes `--check` and cannot link.
+The fix is one prefix, given to both `make bootstrap` and `make install`.
+
+*Two traps, both measured:*
+
+* `idris2` prints the internal error and *exits 0*, having built nothing. Only the
+  artefact tells the truth. `abi-gen-build` therefore removes the old executable
+  first and fails if the new one is absent; `abi-gen-build-self-test` plants the
+  failure and requires a non-zero exit.
+* An empty `IDRIS2_DATA` does *not* reproduce the failure on a healthy install:
+  idris2 still builds. It is therefore not a valid plant. What reproduces the
+  exact error is `IDRIS2_PREFIX` pointing at a prefix that links the installed
+  libraries but has no `support/` directory. (`IDRIS2_PREFIX` pointing at an
+  empty directory fails differently: `Module Prelude not found`, also exit 0.)
+
+*Not re-measured.* The pre-fix install script was not re-run here, because PR #10
+had already landed; the original error was reproduced by withholding `support/`
+from an otherwise complete prefix, which yields the identical message.

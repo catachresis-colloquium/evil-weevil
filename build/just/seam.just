@@ -119,11 +119,20 @@ abi-gate-self-test:
     @echo "==> breaking the ABI three ways to prove the gates notice"
     @bash scripts/abi-gate-self-test.sh
 
+# Prove `abi-gen-build` FAILS when the Idris2 build fails. Plants the half-installed
+# layout (libraries reachable, backend support files withheld) — the exact "Can't
+# find data file chez/support.ss" error, which idris2 0.7.0 reports with exit 0 —
+# and requires the recipe to exit non-zero, then requires it to pass with the plant
+# removed. See tests/workflows/abi_gen_build_test.sh.
+abi-gen-build-self-test:
+    @echo "==> planting a half-installed Idris2 to prove abi-gen-build notices"
+    @bash tests/workflows/abi_gen_build_test.sh
+
 # ── The whole seam, in order ─────────────────────────────────────────────────
 
 # Phase 1 acceptance: model → proofs → generation → no drift → C header compiles
 # → kernel builds and asserts its own layout → both hosts agree on 10,000 ticks.
-seam-check: abi-check abi-header-check kernel-test kernel-host-test abi-gate-self-test
+seam-check: abi-check abi-header-check kernel-test kernel-host-test abi-gate-self-test abi-gen-build-self-test
     @echo ""
     @echo "SEAM OK — the model, the header, the kernel and both null hosts agree,"
     @echo "          and every gate above has been watched to fail on a broken ABI."
