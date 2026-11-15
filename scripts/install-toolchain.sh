@@ -91,23 +91,53 @@ done
 say()  { printf '%s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# The installed version, or empty. Tolerant of tools that print to stderr.
+# The installed version, or empty. Tolerant of tools that print to stderr AND of
+# tools that are present but cannot run: under `set -euo pipefail` a failing
+# `idris2 --version` failed the pipeline and silently killed the whole script at
+# this assignment (exit 127, no output) the moment a cached idris2 without its
+# Chez interpreter was on PATH. A tool that does not run has no version; saying
+# so, and carrying on to repair it, is this function's job.
 zig_version() {
     have zig || return 0
-    zig version 2>/dev/null | head -1
+    { zig version 2>/dev/null || true; } | head -1
 }
 idris2_version() {
     have idris2 || return 0
-    idris2 --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1
+    { idris2 --version 2>/dev/null || true; } | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1
 }
 just_version() {
     have just || return 0
-    just --version 2>/dev/null | sed -n 's/^just \([0-9][0-9.]*\).*/\1/p' | head -1
+    { just --version 2>/dev/null || true; } | sed -n 's/^just \([0-9][0-9.]*\).*/\1/p' | head -1
 }
+
+# Look where this script installs FIRST. A restored CI cache puts the tools under
+# $PREFIX/bin before that directory is on the job's PATH; without this the cached
+# tools were reported as "have none" and the run took the install paths blind.
+export PATH="$PREFIX/bin:$PATH"
 
 ZIG_HAVE="$(zig_version)"
 IDRIS2_HAVE="$(idris2_version)"
 JUST_HAVE="$(just_version)"
+
+# Run as root (a container) or through sudo (a CI runner, a workstation).
+SUDO=""
+[ "$(id -u)" -eq 0 ] || SUDO="sudo"
+
+# Chez Scheme is a RUN-TIME dependency of an Idris2 built with the Chez backend,
+# not only a build-time one: bin/idris2 executes bin/idris2_app/idris2.so, whose
+# first line is `#!/usr/bin/chezscheme --program`. Chez is a system package, so
+# no cache of the toolchain prefix carries it. This used to be installed only on
+# the BUILD path, so the first CI run to restore a good cache (PR #11, 2026-11-14)
+# found idris2 present and unable to start: "idris2_app/idris2.so: not found" is
+# sh reporting the missing interpreter. Ensured whenever idris2 is wanted.
+ensure_chez() {
+    if have chezscheme || have scheme || have chez; then
+        return 0
+    fi
+    say "    installing chezscheme (Idris2's Chez backend needs it to RUN, not only to build)"
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq chezscheme libgmp-dev build-essential
+}
 
 # ── Verify, rather than announce ─────────────────────────────────────────────
 # A toolchain script's job is that the tools WORK, not that they exist. A compiler
@@ -123,8 +153,8 @@ JUST_HAVE="$(just_version)"
 # generator ("Can't find data file chez/support.ss"). The seam gate has to build
 # and run a program, so the verification has to as well.
 #
-# Returns 0 if both pass, 1 if the libraries are unreachable, 2 if a program cannot
-# be built or does not run correctly.
+# Returns 0 if both pass, 3 if idris2 does not start at all, 1 if the libraries are
+# unreachable, 2 if a program cannot be built or does not run correctly.
 verify_idris2() {
     local probe rc=0
     probe="$(mktemp -d)"
@@ -144,7 +174,9 @@ module Main
 main : IO ()
 main = putStrLn "ee-codegen-probe-ok"
 PROBE
-    if ! ( cd "$probe" && idris2 --check Probe.idr >/dev/null 2>&1 ); then
+    if ! idris2 --version >/dev/null 2>&1; then
+        rc=3
+    elif ! ( cd "$probe" && idris2 --check Probe.idr >/dev/null 2>&1 ); then
         rc=1
     elif [ "$( cd "$probe" && idris2 Main.idr -o probe >/dev/null 2>&1 \
                && ./build/exec/probe 2>/dev/null )" != "ee-codegen-probe-ok" ]; then
@@ -160,6 +192,9 @@ PROBE
 # Why verify_idris2 failed, in words a person can act on.
 explain_idris2_failure() {
     case "$1" in
+        3) say "      idris2 does not start (\`idris2 --version\` fails). With the Chez backend"
+           say "      the usual cause is a missing Chez Scheme interpreter: bin/idris2_app/"
+           say "      idris2.so begins with #!/usr/bin/chezscheme." ;;
         1) say "      idris2 cannot find its base libraries (a module importing Data.Nat"
            say "      does not type-check)." ;;
         2) say "      idris2 type-checks but cannot build and run a program: its backend"
@@ -270,16 +305,25 @@ install_idris2() {
     say ""
     say "==> idris2 $IDRIS2_VERSION (bootstrapped with Chez Scheme)"
     local dir="$PREFIX/idris2-$IDRIS2_VERSION"
-    if [ "$IDRIS2_BROKEN" -eq 1 ] && [ -d "$dir" ]; then
-        say "    removing the broken install at $dir before rebuilding it"
-        rm -rf "$dir"
+    ensure_chez
+    mkdir -p "$PREFIX/bin"
+    # An install already in the prefix (a restored cache, an earlier run) is
+    # VERIFIED before it is reused, and rebuilt if it fails. It used to be trusted
+    # because bin/idris2 existed, which is how a cache hit reached the final
+    # verification with an idris2 that could not start.
+    if [ -x "$dir/bin/idris2" ]; then
+        ln -sf "$dir/bin/idris2" "$PREFIX/bin/idris2"
+        local reuse_rc=0
+        verify_idris2 || reuse_rc=$?
+        if [ "$reuse_rc" -eq 0 ]; then
+            say "    reusing the install at $dir (verified: it builds and runs a program)"
+        else
+            say "    the install at $dir fails verification; rebuilding it:"
+            explain_idris2_failure "$reuse_rc"
+            rm -rf "$dir"
+        fi
     fi
     if [ ! -x "$dir/bin/idris2" ]; then
-        if ! have chezscheme && ! have scheme && ! have chez; then
-            say "    installing chezscheme (needs sudo)"
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq chezscheme libgmp-dev build-essential
-        fi
         local scheme
         scheme="$(command -v chezscheme || command -v scheme || command -v chez)"
 
