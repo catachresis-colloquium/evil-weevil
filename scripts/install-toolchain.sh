@@ -98,7 +98,9 @@ zig_version() {
 }
 idris2_version() {
     have idris2 || return 0
-    idris2 --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1
+    # Tolerant of an idris2 that cannot start (a missing Chez runtime): under
+    # pipefail its failure here would end the script before verify_idris2 could say why.
+    { idris2 --version 2>/dev/null || true; } | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p' | head -1
 }
 just_version() {
     have just || return 0
@@ -124,9 +126,18 @@ JUST_HAVE="$(just_version)"
 # and run a program, so the verification has to as well.
 #
 # Returns 0 if both pass, 1 if the libraries are unreachable, 2 if a program cannot
-# be built or does not run correctly.
+# be built or does not run correctly, 3 if idris2 cannot start at all because the
+# Chez Scheme RUNTIME it is compiled for is missing (see idris2_interpreter).
 verify_idris2() {
-    local probe rc=0
+    local probe rc=0 launcher interp
+    launcher="$(command -v idris2 || true)"
+    if [ -n "$launcher" ]; then
+        interp="$(idris2_interpreter "$launcher")"
+        if [ -n "$interp" ] && [ ! -x "$interp" ]; then
+            MISSING_INTERPRETER="$interp"
+            return 3
+        fi
+    fi
     probe="$(mktemp -d)"
     cat > "$probe/Probe.idr" <<'PROBE'
 module Probe
@@ -157,9 +168,54 @@ PROBE
     return "$rc"
 }
 
+# The interpreter the installed idris2 needs, or nothing if it cannot be read.
+#
+# ADDED 2026-11-14 (a CI fix, found on the first cache HIT of the toolchain cache).
+# The idris2 this script builds is a launcher script that execs
+# bin/idris2_app/idris2.so, and idris2.so is a Chez Scheme PROGRAM: its first line is
+# `#!/usr/bin/chezscheme --program`. So idris2 needs the Chez Scheme RUNTIME every time
+# it runs, not only while it is bootstrapped. This script used to install Chez only on
+# the build path, so a toolchain restored from a cache onto a fresh runner could not
+# start ("idris2.so: not found"), and the verification below then blamed the base
+# libraries. Measured: main's run at 5c614d7 was a cache miss and passed; the first run
+# to hit the cache it saved failed exactly so.
+idris2_interpreter() {
+    local launcher app
+    launcher="$(readlink -f -- "$1" 2>/dev/null || true)"
+    [ -n "$launcher" ] || return 0
+    app="$(dirname "$launcher")/idris2_app/idris2.so"
+    [ -f "$app" ] || return 0
+    head -c 256 "$app" | LC_ALL=C sed -n '1s/^#![[:space:]]*\([^[:space:]]*\).*/\1/p'
+}
+
+# Make sure the Chez Scheme runtime that idris2 at $1 needs is present, installing it
+# if it is not. Called on EVERY path that will run idris2, built or restored.
+ensure_chez_runtime() {
+    local interp
+    interp="$(idris2_interpreter "$1")"
+    [ -n "$interp" ] || return 0
+    [ -x "$interp" ] && return 0
+    say "    idris2 needs the Chez Scheme runtime at $interp, which is missing"
+    say "    installing chezscheme (needs sudo)"
+    if ! { sudo apt-get update -qq && sudo apt-get install -y -qq chezscheme; }; then
+        say "    FAIL: could not install chezscheme, and idris2 cannot start without"
+        say "          $interp. Install Chez Scheme, then re-run this script."
+        return 1
+    fi
+    if [ ! -x "$interp" ]; then
+        say "    FAIL: installing chezscheme did not provide $interp."
+        say "          idris2 cannot start without it. Install Chez Scheme so that"
+        say "          $interp exists, then re-run this script."
+        return 1
+    fi
+}
+
 # Why verify_idris2 failed, in words a person can act on.
 explain_idris2_failure() {
     case "$1" in
+        3) say "      idris2 cannot start: it is a Chez Scheme program, and the interpreter it"
+           say "      needs, ${MISSING_INTERPRETER:-chezscheme}, is missing. Install Chez Scheme"
+           say "      (apt-get install chezscheme), or run this script without --check." ;;
         1) say "      idris2 cannot find its base libraries (a module importing Data.Nat"
            say "      does not type-check)." ;;
         2) say "      idris2 type-checks but cannot build and run a program: its backend"
@@ -192,6 +248,17 @@ if [ "$WANT_IDRIS2" -eq 1 ] && [ "$IDRIS2_HAVE" = "$IDRIS2_VERSION" ]; then
         explain_idris2_failure "$verify_rc"
         IDRIS2_BROKEN=1
         missing=$((missing + 1))
+    fi
+elif [ "$WANT_IDRIS2" -eq 1 ] && have idris2; then
+    # An idris2 that cannot even report its version may be one whose Chez Scheme
+    # runtime is missing (a cache restored onto a fresh machine). Say so, rather than
+    # reporting it as absent. It is already counted as missing above.
+    verify_rc=0
+    verify_idris2 || verify_rc=$?
+    if [ "$verify_rc" -eq 3 ]; then
+        say ""
+        say "  idris2 at $(command -v idris2) cannot start:"
+        explain_idris2_failure "$verify_rc"
     fi
 fi
 
@@ -314,6 +381,8 @@ install_idris2() {
         ( cd "$src" && SCHEME="$scheme" make bootstrap -j1 PREFIX="$dir" )
         ( cd "$src" && make install PREFIX="$dir" )
     fi
+    # The runtime, whether idris2 was just built or was restored from a cache.
+    ensure_chez_runtime "$dir/bin/idris2"
     mkdir -p "$PREFIX/bin"
     ln -sf "$dir/bin/idris2" "$PREFIX/bin/idris2"
     say "    installed $("$PREFIX/bin/idris2" --version | head -1) at $dir/bin/idris2"
