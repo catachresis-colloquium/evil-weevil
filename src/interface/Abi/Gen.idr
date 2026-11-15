@@ -48,6 +48,7 @@ cName I64 = "int64_t"
 cName Fx = "ee_fx"
 cName CVersion = "ee_version"
 cName CContact = "ee_contact"
+cName CMindTrace = "ee_mind_trace"
 
 fieldDecl : (String, CType) -> String
 fieldDecl (n, t) = "  " ++ cName t ++ " " ++ n ++ ";"
@@ -97,6 +98,7 @@ allIntentFlags =
   , ("STARTLE", intentFlagStartle)
   , ("HESITATE", intentFlagHesitate)
   , ("FIXATE", intentFlagFixate)
+  , ("CAUGHT", intentFlagCaught)
   ]
 
 ||| Bits in `ee_agent.flags` — the agent's own state, as opposed to the intent it
@@ -110,7 +112,7 @@ agentFlagZigConst (n, v) = "pub const AGENT_FLAG_" ++ n ++ ": u32 = " ++ show v 
 
 public export
 allAgentFlags : List (String, Nat)
-allAgentFlags = [ ("MEMORY_VALID", agentFlagMemoryValid) ]
+allAgentFlags = [ ("MEMORY_VALID", agentFlagMemoryValid), ("EXPOSED", agentFlagExposed) ]
 
 ||| The agent's mode field (ADR-0012): a shift, a mask and the codes that go in it.
 ||| Emitted because the mode IS on the wire — it lives in `ee_agent.flags`, which the
@@ -132,6 +134,7 @@ allAgentModes =
   , ("EVADE", agentModeEvade)
   , ("RELOAD", agentModeReload)
   , ("INVESTIGATE", agentModeInvestigate)
+  , ("STALK", agentModeStalk)
   ]
 
 ||| ABI 1.1 (ADR-0013): the names of the mind. Every list below is (NAME, value) and
@@ -147,7 +150,8 @@ mindConstGroups =
     , [ ("DAMAGE_SOURCE", contactFlagDamageSource) ] )
   , ( "TELL"
     , "Bits in ee_mind_trace.tells: the intent tell bits shifted down by four."
-    , [ ("STARTLE", tellStartle), ("HESITATE", tellHesitate), ("FIXATE", tellFixate) ] )
+    , [ ("STARTLE", tellStartle), ("HESITATE", tellHesitate), ("FIXATE", tellFixate)
+      , ("CAUGHT", tellCaught) ] )
   , ( "MIND_FLAG"
     , "Bits in ee_mind.flags."
     , [ ("PRIMED", mindFlagPrimed), ("GRUDGE_LEAD", mindFlagGrudgeLead)
@@ -165,6 +169,23 @@ mindConstGroups =
   , ( "MASS"
     , "Full scale of ee_mind_trace.attention, in units of 1/10000 (a mass, not a probability)."
     , [ ("FULL", massFull) ] )
+  ]
+
+||| ABI 1.2 (ADR-0014): the names of the model of the target's knowledge. Emitted after
+||| the mind's groups, so every line they add to the header is an addition.
+public export
+modelConstGroups : List (String, String, List (String, Nat))
+modelConstGroups =
+  [ ( "CONTACT_FLAG"
+    , "ABI 1.2: more bits in ee_contact.flags (read only by ee_tick_mind, with EE_CAP_OBSERVATION_CUES)."
+    , [ ("OBSERVES", contactFlagObserves) ] )
+  , ( "AGENT_EXPOSURE"
+    , "ABI 1.2: the exposure lifetime counter inside ee_agent.flags, bits 8..15 (ADR-0014)."
+    , [ ("SHIFT", agentExposureShift), ("MASK", agentExposureMask) ] )
+  , ( "EXPOSURE_CAUSE"
+    , "Why exposure changed: ee_model_trace.exposure_cause. NONE exactly when it did not."
+    , [ ("NONE", exposureCauseNone), ("CUE", exposureCauseCue)
+      , ("OWN_ATTACK", exposureCauseOwnAttack), ("EXPIRY", exposureCauseExpiry) ] )
   ]
 
 mindGroupC : (String, String, List (String, Nat)) -> String
@@ -231,6 +252,11 @@ layoutChecksum = checksumOf frozenStructs
 ||| `ee_tick_mind` can compare `ee_mind_fingerprint()` against `EE_MIND_FINGERPRINT`.
 mindChecksum : Nat
 mindChecksum = checksumOf mindStructs
+
+||| ABI 1.2 (ADR-0014): the same detector over `ee_model_trace` alone, so neither the 1.0
+||| nor the 1.1 number moves. Its first member counts as one field of 32 bytes.
+modelChecksum : Nat
+modelChecksum = checksumOf modelStructs
 
 --------------------------------------------------------------------------------
 -- Cross-checks — nothing is emitted until these pass
@@ -342,6 +368,8 @@ headerPreamble =
     , "#define EE_ABI_FINGERPRINT " ++ show layoutChecksum ++ "ULL"
     , "/* ABI 1.1: the fingerprint of ee_mind and ee_mind_trace only (ADR-0013). */"
     , "#define EE_MIND_FINGERPRINT " ++ show mindChecksum ++ "ULL"
+    , "/* ABI 1.2: the fingerprint of ee_model_trace only (ADR-0014). */"
+    , "#define EE_MODEL_FINGERPRINT " ++ show modelChecksum ++ "ULL"
     , ""
     , "/* Q16.16 fixed point: all kernel arithmetic is integer (ADR-0006). */"
     , "#define EE_FX_FRACTION_BITS " ++ show fxFractionBits
@@ -384,6 +412,16 @@ entryPoints =
     , "                       ee_mind *mind, ee_intent *out, ee_mind_trace *trace);"
     , "uint64_t ee_mind_fingerprint(void);"
     , ""
+    , "/*"
+    , " * ABI 1.2 (ADR-0014): the model of the target's knowledge. No new entrance. A host"
+    , " * that declares EE_CAP_OBSERVATION_CUES and sets EE_CONTACT_FLAG_OBSERVES gets the"
+    , " * exposure belief, the stalk mode and the CAUGHT tell; a host that does not gets"
+    , " * 1.1 exactly. To read the model, pass `&model.mind` of an `ee_model_trace` whose"
+    , " * `mind.struct_size` is sizeof(ee_model_trace); a 1.1-sized trace is written as at"
+    , " * 1.1 and nothing past it is touched."
+    , " */"
+    , "uint64_t ee_model_fingerprint(void);"
+    , ""
     , "#if defined(__cplusplus)"
     , "}"
     , "#endif"
@@ -415,6 +453,7 @@ renderHeader =
              ++ "/* Ticks a sighting stays actionable before the agent forgets it (Phase 2). */\n"
              ++ "#define EE_MEMORY_TTL " ++ show memoryTtl ++ "u\n\n"
              ++ concatMap mindGroupC mindConstGroups
+             ++ concatMap mindGroupC modelConstGroups
              ++ unlines (map structBlock sts)
              ++ unlines (concatMap staticAsserts sts)
              ++ "\n"
@@ -441,6 +480,7 @@ zigPreamble =
       , "pub const abi_minor: u32 = " ++ cVersionMinor abiVersion ++ ";"
       , "pub const abi_fingerprint: u64 = " ++ show layoutChecksum ++ ";"
       , "pub const mind_fingerprint: u64 = " ++ show mindChecksum ++ ";"
+      , "pub const model_fingerprint: u64 = " ++ show modelChecksum ++ ";"
       , "pub const fx_fraction_bits: u32 = " ++ show fxFractionBits ++ ";"
       , "pub const fx_one: i32 = " ++ show fxOne ++ ";"
       , ""
@@ -459,6 +499,7 @@ zigPreamble =
       ++ map agentModeZigConst allAgentModes
       ++ [ "pub const memory_ttl: u32 = " ++ show memoryTtl ++ ";" ]
       ++ concatMap mindGroupZig mindConstGroups
+      ++ concatMap mindGroupZig modelConstGroups
       ++ [ "" ] )
 
 zigStruct : (Struct, List Nat) -> List String
@@ -524,6 +565,7 @@ main = do
   putStrLn ("  abi version:   " ++ cVersionNum abiVersion ++ "." ++ cVersionMinor abiVersion)
   putStrLn ("  fingerprint:   " ++ show layoutChecksum)
   putStrLn ("  mind (1.1):    " ++ show mindChecksum)
+  putStrLn ("  model (1.2):   " ++ show modelChecksum)
   case (renderHeader, renderZig) of
     (Left m, _) => reportMismatch m
     (_, Left m) => reportMismatch m

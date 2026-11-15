@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: CC-BY-SA-4.0
+// Copyright (c) 2026 Jonathan D.A. Jewell (metadatastician) <j.d.a.jewell@open.ac.uk>
+= Architecture Decision Record: 0014-it-models-you
+
+== 14. It models you: mind slice 2, as an additive ABI 1.2
+
+Date: 2026-11-14
+
+=== Status
+
+Proposed. Implemented in the same change; the owner's acceptance is outstanding.
+Nothing here is accepted until the owner says so. The last section lists what is
+deliberately left to the owner.
+
+=== Context
+
+The owner selected mind slice 2 on 2026-11-14 ("It models you"). The agent holds a
+first-order model of a target's knowledge, "T knows where I am", called *exposure*. It
+acts on that model, and it can be wrong about it. The plan is the Enaction Engine's
+`WEEVIL-SLICE-2-IT-MODELS-YOU`, work package C1. Its sections "The effect" and
+"Mechanism in the host kernel" bind this record.
+
+The licence boundary is the same as in ADR-0013. This kernel is MPL-2.0 and denies
+AGPL. The Enaction Engine is AGPL. No Enaction source entered this repository. The only
+files read from the sibling repository were the slice plan and its ADR-0027, and they
+were read as specifications. The mechanism is written here, in integer Zig.
+
+Five rules bind the work. The first four come from slice 1. The fifth is this slice's
+acceptance test, and it was chosen before the work began:
+
+. Integer and fixed point only. No libm, no float.
+. Affect buys attention, never belief. Exposure is a BELIEF, so only evidence may set
+  it: the host's cue, or the agent's own attack. No reservoir may set it or clear it.
+. The trace carries rankings and selections, never a score or a reservoir value.
+. Every change of exposure and every change of affect token carries its cause.
+. No change without the capability. A host that does not declare the new capability
+  gets ABI 1.1 behaviour exactly. A host that never calls the mind entrance gets 1.0
+  exactly. The ten pinned digests of 1.0 (4) and 1.1 (6) must be byte-identical before
+  and after. They are (section 7).
+
+=== Decision
+
+==== 1. The version: ABI 1.2, additive, with no new entrance
+
+ADR-0005 rule 5 says that an additive change is a minor version. Nothing here changes
+the meaning, size or offset of an existing field. So the version is *1.2*.
+`EE_ABI_MINOR` moves from 1 to 2, and that is the only changed line in the generated
+header. Every other line of its diff is an addition. `EE_ABI_FINGERPRINT` stays
+18276775, and `EE_MIND_FINGERPRINT` stays 1047490. The new struct has its own
+fingerprint, `EE_MODEL_FINGERPRINT` = 69857, exported as `ee_model_fingerprint()`.
+`ee_init` accepts hosts that declare minor 0, 1 or 2, and a boundary test checks all
+three.
+
+*No new entrance.* `ee_tick_mind` keeps its signature. The size that the host writes
+into the trace tells the kernel which record it passed. This is the use `struct_size`
+was put at offset 0 for.
+
+* If `struct_size` is less than 32, the call is refused, as at 1.1.
+* If it is from 32 to 39, the kernel writes exactly the 32-byte 1.1 record, as at 1.1,
+  and sets `struct_size` back to 32. Nothing past byte 32 is touched. A boundary test
+  puts a canary in bytes 32 to 39, with the capability declared and a cue given, and
+  the canary survives.
+* If it is 40 or more, the pointer is the `mind` member of an `ee_model_trace`, and the
+  kernel writes all 40 bytes.
+
+The brief offered a new entrance as a fallback. It was not needed, because the trace
+extends by its own first member (below) and the state fits in undefined bits (section 2).
+
+`ee_model_trace` (40 bytes, new) is written once per call when the host passes the 1.2
+size:
+
+[cols="2,2,1,4",options="header"]
+|===
+| Field | Type | Offset | Meaning
+| mind | ee_mind_trace | 0 | the whole 1.1 record (32 bytes); a host passes `&model.mind`
+| exposure_contact | u16 | 32 | the contact behind the cause: the observer for a cue, the struck target for an own attack, 0 otherwise
+| exposure | u8 | 34 | the belief as the tick closed, 0 or 1
+| exposure_prev | u8 | 35 | the belief as the tick opened, 0 or 1
+| exposure_cause | u8 | 36 | `EE_EXPOSURE_CAUSE_*`; NONE exactly when `exposure == exposure_prev`
+| reserved0 | u8 | 37 | written 0
+| reserved1 | u16 | 38 | written 0
+|===
+
+The first member is the 1.1 record itself, not a copy of its fields. A new model type,
+`CMindTrace` (size 32, alignment 8), names it. The C compiler therefore guarantees the
+prefix. `Abi.Layout.mindTraceIsThePrefix` proves that the member is at offset 0 and is
+exactly 32 bytes long, and `modelTraceOffsets` proves the rest. The C header asserts
+every offset, and so does Zig's comptime gate.
+
+==== 2. Where the state lives: in bits the 1.0 freeze left undefined
+
+Exposure is a belief. The memory, which is the other belief, lives in `ee_agent`, and
+the affect lives in `ee_mind`. So exposure lives in `ee_agent.flags`, beside the
+memory. This follows ADR-0009, which put the memory flag in bit 0, and ADR-0012, which
+put the mode in bits 1 to 3.
+
+[cols="2,1,4",options="header"]
+|===
+| Where | Value | Meaning
+| `ee_agent.flags` bit 4 | `EE_AGENT_FLAG_EXPOSED` 16 | the belief as the last `ee_tick_mind` closed
+| `ee_agent.flags` bits 8..15 | `EE_AGENT_EXPOSURE_SHIFT` 8, `_MASK` 65280 | the ticks the belief still has without new evidence
+| mode field, code 5 | `EE_AGENT_MODE_STALK` 5 | the stalk mode; 1.0 sized the field for eight codes and filled five
+| `ee_contact.flags` bit 1 | `EE_CONTACT_FLAG_OBSERVES` 2 | the host's cue: this contact observes the agent on this tick
+| capability bit 10 | `EE_CAP_OBSERVATION_CUES` | the host can give the cue
+| `ee_intent.flags` bit 7 | `EE_INTENT_FLAG_CAUGHT` 128 | the CAUGHT tell, on the intent
+| `ee_mind_trace.tells` bit 3 | `EE_TELL_CAUGHT` 8 | the same tell, in the trace (the intent bit shifted down by four)
+|===
+
+`ee_tick` never reads or writes bits 4 to 15. Its mode write (`setMode`) masks 14, and
+its memory writes touch bit 0 only. `Abi.Types.exposureBitsClearOfTheFrozenBits`
+proves that the new bits are clear of both. A Zig test writes a mode twice over a live
+counter and reads the counter back unchanged.
+
+Bits 5 to 7 and 16 to 31 of `ee_agent.flags` stay undefined.
+
+==== 3. The belief
+
+Exposure is true on a tick with a cue. It stays true for `EXPOSURE_TTL` ticks after the
+last cue. The agent's own attack also sets it, because an attack reveals the attacker.
+When the lifetime runs out with no evidence, exposure clears. In detail:
+
+* *The cue* is the first visible contact, in published order, that carries
+  `EE_CONTACT_FLAG_OBSERVES`. The kernel reads it only under `EE_CAP_OBSERVATION_CUES`.
+  It reads contacts only up to `contact_count`.
+* *The belief the decision uses* is "a cue now, or a belief still alive". The agent's
+  own attack is this tick's act, so it counts from the next tick.
+* *The lifetime is a counter, not a leak* (ADR-0013's lesson). Evidence sets it to
+  `EXPOSURE_TTL`. Each tick without evidence takes one off. On the tick it would go
+  below zero, the belief expires.
+* *Every change has a cause*: `CUE`, `OWN_ATTACK` (an `ATTACK` the body actually made,
+  not one suppressed by a freeze or a hesitation) or `EXPIRY`. When the belief did not
+  change, the cause is NONE.
+* The kernel clamps the counter on the way in to `EXPOSURE_TTL`, against a host that
+  wrote garbage. The counter means something only while the flag is set.
+* *Without the capability* the kernel reads no exposure bit and writes none. A Zig test
+  sets both bits, declares nothing, gives a cue for 50 ticks, and finds the bits
+  untouched, exposure 0 and no CAUGHT.
+
+No reservoir is an argument to `stepExposure`, `readExposure` or `writeExposure`.
+`Abi.Exposure.exposedAfter` makes the same point in the model: its arguments are the
+capability, the belief, whether it is alive, the cue and the attack.
+
+==== 4. The candidate: stalk
+
+While a target is visible, exposure is false and the token is not AFRAID, the agent may
+select *stalk*. Stalk is `EE_ACTION_TAKE_COVER`, which the ABI has defined since 1.0
+and nothing produced until now, in mode 5. The agent moves toward the target at half
+pace, in cover, watching it. Stalk scores `UTILITY_STALK` beyond `STRIKE_RANGE` and 0
+inside it. So:
+
+* Beyond strike range and inside attack range, stalk (55705) outranks engage (52428):
+  concealment defers the strike.
+* Inside strike range, stalk scores 0 and engage is first. A stalking incumbent cannot
+  hold, because 0 + 8192 is less than 52428.
+* An engagement already begun is not abandoned for a stalk, because 52428 + 8192 is
+  more than 55705.
+* A wounded agent flees before it starts a stalk, because 55705 is less than 58982.
+* A stalker always reloads, because 55705 + 8192 = 63897 is less than 65536.
+* When exposure is true, the candidate list is 1.1's, so the ranking is 1.1's.
+  `exposedRankingIsTheMindRanking` proves this for every situation, capability,
+  contact and token.
+* Without a navmesh, the stalker stays in its cover: speed 0, no movement, and
+  `EE_INTENT_FLAG_UNREACHABLE` set. This is the ADR-0004 ladder, the same as for
+  ADVANCE. It is applied inside `tickMind`, because only stalk produces TAKE_COVER.
+  A boundary test checks it.
+
+Stalk is appended last to the tie-break order, so a ranking with stalk has six modes.
+
+==== 5. The tell: caught
+
+*CAUGHT* is a cue that arrives on a tick that opened unexposed, while the agent's mode
+is STALK. The body freezes for that tick, as for STARTLE: it holds, and its look snaps
+to the observer. The decision on that tick is already made as exposed, and it is
+traced. From the next tick on, the agent acts as exposed. A second CAUGHT cannot
+follow until the belief has lapsed, because a cue always exposes (`aCueExposes`), and
+CAUGHT needs a tick that opened unexposed (`noSecondCatchWhileExposed`).
+
+==== 6. The trace and `enaction-mind-trace/1`
+
+A host can report everything the slice plan asks for, without a score or a reservoir
+value:
+
+* *Exposure on each tick* is `exposure`. Its value at the start of the tick is
+  `exposure_prev`.
+* *Its cause on a change* is `exposure_cause` and `exposure_contact`. Both hosts check
+  on every tick of every fixture that the cause is NONE exactly when the value did not
+  change, and they measured 0 violations.
+* *Stalk as a candidate* is mode code 5 in the ranking nibbles. `ranking_count` is 6
+  when stalk is ranked.
+* *Caught as a tell* is `tells` bit 3, and `ee_intent.flags` bit 7.
+
+The producer declares the vocabulary terms `stalk` (candidate 5) and `caught` (tell 3).
+The contract owns no candidate or tell names, so `enaction-mind-trace/1` needs no
+change. The exposure counter is not in the trace: it is belief bookkeeping, and the
+trace carries the belief and its causes, not its clock. The host builds C2's model
+documents from `exposure`, `exposure_cause` and `exposure_contact`.
+
+==== 7. The fixtures, the pins, and the measured figures
+
+The ten baseline pins were recorded on the untouched tree (5c614d7) before any change.
+After the change they are byte-identical, in both hosts:
+
+[cols="3,2,1",options="header"]
+|===
+| Pin | Value | After
+| `ee_tick` 10,000-tick trace | 11339491356780309808 | unchanged
+| `ee_tick` memory-off | 1235117735680515552 | unchanged
+| `ee_tick` chase | 12283675074724005768 | unchanged
+| `ee_tick` wounded duel | 5191914376283395890 | unchanged
+| mind: the grudge | 5543746349701543370 | unchanged
+| mind: the grudge's control | 7615732920466510316 | unchanged
+| mind: the flinch | 8915218119681936373 | unchanged
+| mind: the flinch's control | 5970917412374617350 | unchanged
+| mind: the frightened duel | 11063771574841757445 | unchanged
+| mind: the crowd | 2365169153326385312 | unchanged
+|===
+
+The new fixtures have one target, id 41, on a fixed bearing. The world's one rule is
+that the range closes by `speed × 2048` per tick while the agent ADVANCEs or stalks.
+Each control differs from its fixture in one input only: `EE_CAP_OBSERVATION_CUES` is
+withheld. The snapshots are the same, cue bit included. The fold covers the intent
+(action, target, move x and y, look x, speed, priority, flags), the 1.1 trace, and the
+model fields. Both hosts assert every value below:
+
+[cols="2,4,2",options="header"]
+|===
+| Fixture | Measured | Digest, both hosts
+| the stalker | stalks ticks 0..159, first engage at tick *160* at range 0.5; its own attack then exposes it | 5067313941334346860
+| the stalker's control | first engage at tick *64* at range 1.0; no exposure, never a stalk in the ranking | 5359463348611598049
+| caught | one CAUGHT tell, at tick *100*; exposure true from 100 to 199; 0 stalk selections after 100; engages at 115 | 3395485040061069912
+| caught's control | the stalker control's digest exactly: the cue bit without the capability is ignored | 5359463348611598049
+| false exposure | one glance at tick 20, then none. Exposure is true on *90* ticks with no cue, expires at 111, and the stalk resumes at 111. The glance also produced one CAUGHT (the agent was stalking). | 11105738738098638480
+| false exposure's control | *0* exposed ticks | 11366903142131820018
+| the ambush | target inside strike range from tick 0, never cues, falls at 30. Exposure is set by the own attack at tick 0, held while striking, and expires at 120 | 1370696199260345134
+| the ambush's control | no exposure | 10128845661911672413
+| chase, all bits declared | the 1.1 chase-at-rest fixture with `0xFFFF_FFFF` (section 9): 3000 stalks | 421035655961441872
+|===
+
+==== 8. The constants, and what each was MEASURED to do
+
+Each constant was changed by itself in a scratch copy of the tree, and both hosts were
+run on it. The "Measured" column is that run, not a prediction. Every perturbation
+moved at least one pinned digest, and none moved a 1.0 or 1.1 pin.
+
+[cols="2,1,1,5",options="header"]
+|===
+| Constant | Value | Perturbed to | Measured (pins moved; readings)
+| EXPOSURE_TTL | 90 | 60 | false exposure and the ambush. False exposure has 60 no-cue ticks and expires at 81; the ambush expires at 90. The stalker and caught did not move: their own attacks refresh the belief, so they never see the lifetime end.
+| STRIKE_RANGE | 32768 | 16384 | the stalker and the ambush. The stalker engages at 176 at range 0.25. The ambush now stalks for 8 ticks first and engages at tick 8.
+| UTILITY_STALK | 55705 | 54000 | the stalker, caught and false exposure, through the priority the intent reports. No behaviour changed: the first engage is still 160.
+| UTILITY_STALK | 55705 | 50000 (below engage) | the same three pins. The first engage is *still* 160 (see section 9).
+| STALK_SPEED | 32768 | 16384 | the stalker, caught and false exposure. The stalker never reaches strike range in 200 ticks, and caught engages at 140.
+|===
+
+The planted control was run before this record was written. `EXPOSURE_TTL` was changed
+from 90 to 60 in the real tree. `just seam-check` FAILED (exit 1, 50 of 53 Zig tests,
+the three lifetime tests failing), and the change was then reverted.
+
+The new mode code, tell bit, flag bits and cause codes are ABI, not policy. Nobody
+tunes them, so they have no rows. `CLOSE_STEP` (2048) belongs to the fixtures' world,
+not to the kernel.
+
+==== 9. Surprises (measured, not predicted)
+
+. *A host that declares every bit declares the future.* One 1.1 test, "a mind held at
+  rest reproduces 1.0's chase", declared `0xFFFF_FFFF`, which includes bits that no
+  capability had at 1.1. Bit 10 is now the cue capability. A host that declares it and
+  never gives a cue tells the kernel that nobody ever sees the agent, so the agent
+  stalks, and the test's digest became 421035655961441872. The claim of that test is
+  about a mind at rest, so it now declares exactly the ten capabilities 1.1 defined,
+  and its pinned value is unchanged. The `0xFFFF_FFFF` arm is pinned as its own test
+  in both hosts. This is the slice plan's "false concealment" case, produced by
+  accident by a real test. `ee_init` does not mask capability bits that a host's
+  declared minor does not define. Whether it should is left to the owner.
+. *The margin, not the weight, defers the strike.* With `UTILITY_STALK` lowered below
+  engage (50000), the stalker still engages at tick 160. It starts stalking far away,
+  and once stalk is the incumbent, 50000 + 8192 = 58192 holds against 52428 all the
+  way to strike range. So the weight's order, stalk above engage, decides only for an
+  agent that first sees its target inside attack range. `theStalkerHoldsItsStrike`
+  pins that moment in the model. The fixtures do not exercise it.
+. *A wounded stalker that is not afraid keeps stalking.* A stalking incumbent scores
+  55705 + 8192 = 63897, and flight scores at most 58982 + 4096 = 63078. So until the
+  token becomes AFRAID (which removes the candidate), a wounded stalker does not flee.
+  This is stated in `Abi.Exposure` as not claimed. No fixture reaches it.
+. *The lifetime is invisible where the agent fights.* In the stalker and in caught, the
+  agent's own attacks refresh exposure every tick, so changing `EXPOSURE_TTL` moved
+  neither. Only false exposure and the ambush can see the lifetime, which is why the
+  ambush's control is pinned too.
+. *False exposure also produces a CAUGHT.* The glance at tick 20 arrives while the
+  agent is stalking, so it is a CAUGHT as well as a false exposure. That is correct,
+  and the fixture asserts it.
+. *Toolchain.* The Idris2 source tarball was refused by the session's GitHub proxy (403,
+  repository scope). The v0.7.0 tag was cloned with git into the directory where
+  `scripts/install-toolchain.sh` looks for its source, and the unmodified script then
+  bootstrapped and verified Idris2. It built and ran a program. The `IDRIS2_DATA` trap
+  reported by the slice 1 session did not recur with the script now on `main`, so no
+  `IDRIS2_DATA` or `IDRIS2_LIBS` export was needed.
+
+=== Consequences
+
+==== Positive
+
+* "It models you, and it can be wrong" becomes a count that a test can check: 90
+  exposed ticks against 0, on two runs that differ by one capability bit.
+* The four cases of the slice plan are all produced: true concealment (the stalker),
+  caught in the act (caught), false exposure, and false concealment (the all-bits
+  chase).
+* The 1.0 and 1.1 surfaces did not move. The ten digests, both fingerprints and every
+  existing offset are byte-identical, and a 1.1 host passing a 32-byte trace has its
+  32 bytes written and nothing more.
+
+==== Negative
+
+* Constants are duplicated between `Abi.Exposure` and the kernel, as in ADR-0010 and
+  ADR-0013. The theorems and the eight digests tie them. `STALK_SPEED` is in no
+  theorem: only the digests tie it.
+* The exposure state sits in a flags word, as the mode does. Bits 5 to 7 and 16 to 31
+  of `ee_agent.flags` are now the last spare state in the frozen structs.
+* The mind's work is still not counted in `workUnits`.
+
+==== Neutral
+
+* The model consumes no randomness, so the trace stays seed-independent.
+* If a host calls `ee_tick` between `ee_tick_mind` calls, the exposure counter does not
+  age on the `ee_tick` ticks, and `ee_tick` reads mode 5 as a mode with no candidate
+  (no margin). No fixture does this.
+
+=== Left to the owner
+
+* *Acceptance of this record and of ABI 1.2.*
+* *Whether `ee_init` should mask capability bits that the host's declared minor does
+  not define* (section 9, first surprise). Recommended, as the more elegant long-term
+  arm: the handshake already carries `abi_minor`, so a 1.1 host could never be given a
+  1.2 meaning by accident. It is not done here, because it changes the output of
+  `ee_init`, a 1.0 entrance, for any host that set undefined bits. That is a decision
+  for the owner, and it would need its own ADR.
+* *Exposure per target.* The cue counts from any visible contact, the first in
+  published order, so the model is "a target knows where I am", not "T knows". A
+  per-target model needs an id slot. `ee_agent.flags` bits 16 to 31 could hold one,
+  as a 1.3 decision.
+* *What a host does with CAUGHT and with stalk.* The kernel says what the body does
+  (freeze, look, move in cover at half pace). The animation and the legibility symbol
+  belong to hosts and games.
+* *Whether a wounded, unafraid stalker should flee* (section 9, third surprise).
