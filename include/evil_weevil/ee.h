@@ -35,10 +35,12 @@ extern "C" {
 #endif
 
 #define EE_ABI_MAJOR 1
-#define EE_ABI_MINOR 1
+#define EE_ABI_MINOR 2
 #define EE_ABI_FINGERPRINT 18276775ULL
 /* ABI 1.1: the fingerprint of ee_mind and ee_mind_trace only (ADR-0013). */
 #define EE_MIND_FINGERPRINT 1047490ULL
+/* ABI 1.2: the fingerprint of ee_model_trace only (ADR-0014). */
+#define EE_MODEL_FINGERPRINT 69857ULL
 
 /* Q16.16 fixed point: all kernel arithmetic is integer (ADR-0006). */
 #define EE_FX_FRACTION_BITS 16
@@ -55,6 +57,7 @@ typedef int32_t ee_fx;
 #define EE_CAP_SOUND_EVENTS (1u << 7u)
 #define EE_CAP_VEHICLE_BOARDING (1u << 8u)
 #define EE_CAP_TERRAIN_HEIGHT (1u << 9u)
+#define EE_CAP_OBSERVATION_CUES (1u << 10u)
 
 #define EE_STATUS_OK 0
 #define EE_STATUS_BAD_PARAM 1
@@ -85,9 +88,11 @@ typedef uint32_t ee_status;
 #define EE_INTENT_FLAG_STARTLE 16u
 #define EE_INTENT_FLAG_HESITATE 32u
 #define EE_INTENT_FLAG_FIXATE 64u
+#define EE_INTENT_FLAG_CAUGHT 128u
 
 /* Bits in ee_agent.flags. */
 #define EE_AGENT_FLAG_MEMORY_VALID 1u
+#define EE_AGENT_FLAG_EXPOSED 16u
 
 /* The mode field inside ee_agent.flags: bits 1..3 (ADR-0012). */
 #define EE_AGENT_MODE_SHIFT 1u
@@ -97,6 +102,7 @@ typedef uint32_t ee_status;
 #define EE_AGENT_MODE_EVADE 2u
 #define EE_AGENT_MODE_RELOAD 3u
 #define EE_AGENT_MODE_INVESTIGATE 4u
+#define EE_AGENT_MODE_STALK 5u
 
 /* Ticks a sighting stays actionable before the agent forgets it (Phase 2). */
 #define EE_MEMORY_TTL 36u
@@ -108,6 +114,7 @@ typedef uint32_t ee_status;
 #define EE_TELL_STARTLE 1u
 #define EE_TELL_HESITATE 2u
 #define EE_TELL_FIXATE 4u
+#define EE_TELL_CAUGHT 8u
 
 /* Bits in ee_mind.flags. */
 #define EE_MIND_FLAG_PRIMED 1u
@@ -133,6 +140,19 @@ typedef uint32_t ee_status;
 
 /* Full scale of ee_mind_trace.attention, in units of 1/10000 (a mass, not a probability). */
 #define EE_MASS_FULL 10000u
+
+/* ABI 1.2: more bits in ee_contact.flags (read only by ee_tick_mind, with EE_CAP_OBSERVATION_CUES). */
+#define EE_CONTACT_FLAG_OBSERVES 2u
+
+/* ABI 1.2: the exposure lifetime counter inside ee_agent.flags, bits 8..15 (ADR-0014). */
+#define EE_AGENT_EXPOSURE_SHIFT 8u
+#define EE_AGENT_EXPOSURE_MASK 65280u
+
+/* Why exposure changed: ee_model_trace.exposure_cause. NONE exactly when it did not. */
+#define EE_EXPOSURE_CAUSE_NONE 0u
+#define EE_EXPOSURE_CAUSE_CUE 1u
+#define EE_EXPOSURE_CAUSE_OWN_ATTACK 2u
+#define EE_EXPOSURE_CAUSE_EXPIRY 3u
 
 typedef struct {
   uint16_t major;
@@ -393,6 +413,25 @@ typedef struct {
 #define EE_OFFSET_ee_mind_trace_tells 30
 #define EE_OFFSET_ee_mind_trace_reserved0 31
 
+typedef struct {
+  ee_mind_trace mind;
+  uint16_t exposure_contact;
+  uint8_t exposure;
+  uint8_t exposure_prev;
+  uint8_t exposure_cause;
+  uint8_t reserved0;
+  uint16_t reserved1;
+} ee_model_trace;
+
+#define EE_SIZEOF_ee_model_trace 40
+#define EE_OFFSET_ee_model_trace_mind 0
+#define EE_OFFSET_ee_model_trace_exposure_contact 32
+#define EE_OFFSET_ee_model_trace_exposure 34
+#define EE_OFFSET_ee_model_trace_exposure_prev 35
+#define EE_OFFSET_ee_model_trace_exposure_cause 36
+#define EE_OFFSET_ee_model_trace_reserved0 37
+#define EE_OFFSET_ee_model_trace_reserved1 38
+
 EE_STATIC_ASSERT(sizeof(ee_version) == EE_SIZEOF_ee_version, "size");
 EE_STATIC_ASSERT(offsetof(ee_version, major) == EE_OFFSET_ee_version_major, "offset");
 EE_STATIC_ASSERT(offsetof(ee_version, minor) == EE_OFFSET_ee_version_minor, "offset");
@@ -509,6 +548,14 @@ EE_STATIC_ASSERT(offsetof(ee_mind_trace, token_prev) == EE_OFFSET_ee_mind_trace_
 EE_STATIC_ASSERT(offsetof(ee_mind_trace, cause) == EE_OFFSET_ee_mind_trace_cause, "offset");
 EE_STATIC_ASSERT(offsetof(ee_mind_trace, tells) == EE_OFFSET_ee_mind_trace_tells, "offset");
 EE_STATIC_ASSERT(offsetof(ee_mind_trace, reserved0) == EE_OFFSET_ee_mind_trace_reserved0, "offset");
+EE_STATIC_ASSERT(sizeof(ee_model_trace) == EE_SIZEOF_ee_model_trace, "size");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, mind) == EE_OFFSET_ee_model_trace_mind, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, exposure_contact) == EE_OFFSET_ee_model_trace_exposure_contact, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, exposure) == EE_OFFSET_ee_model_trace_exposure, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, exposure_prev) == EE_OFFSET_ee_model_trace_exposure_prev, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, exposure_cause) == EE_OFFSET_ee_model_trace_exposure_cause, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, reserved0) == EE_OFFSET_ee_model_trace_reserved0, "offset");
+EE_STATIC_ASSERT(offsetof(ee_model_trace, reserved1) == EE_OFFSET_ee_model_trace_reserved1, "offset");
 
 /*
  * Entry points. The kernel performs NO allocation: `ee_context` and the
@@ -540,6 +587,16 @@ const char *ee_status_name(ee_status status);
 ee_status ee_tick_mind(ee_context *ctx, const ee_snapshot *snap, ee_agent *agent,
                        ee_mind *mind, ee_intent *out, ee_mind_trace *trace);
 uint64_t ee_mind_fingerprint(void);
+
+/*
+ * ABI 1.2 (ADR-0014): the model of the target's knowledge. No new entrance. A host
+ * that declares EE_CAP_OBSERVATION_CUES and sets EE_CONTACT_FLAG_OBSERVES gets the
+ * exposure belief, the stalk mode and the CAUGHT tell; a host that does not gets
+ * 1.1 exactly. To read the model, pass `&model.mind` of an `ee_model_trace` whose
+ * `mind.struct_size` is sizeof(ee_model_trace); a 1.1-sized trace is written as at
+ * 1.1 and nothing past it is touched.
+ */
+uint64_t ee_model_fingerprint(void);
 
 #if defined(__cplusplus)
 }

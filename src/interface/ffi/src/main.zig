@@ -169,8 +169,25 @@ pub export fn ee_tick_mind(
     var r = kernel.tickMind(c, s, a, m);
     kernel.degradeForCapabilities(c, &r.intent);
     o.* = r.intent;
-    if (trace) |t| t.* = r.trace;
+    if (trace) |t| {
+        // ABI 1.2 (ADR-0014): the size the host wrote says which record it passed. A
+        // 1.1-sized record is written exactly as at 1.1 — 32 bytes, nothing past them —
+        // and a record of at least the 1.2 size is the `mind` member of an
+        // `ee_model_trace`, which `Abi.Layout.mindTraceIsThePrefix` lays out at offset 0.
+        if (t.struct_size >= @sizeOf(abi.EeModelTrace)) {
+            const mt: *abi.EeModelTrace = @ptrCast(@alignCast(t));
+            mt.* = r.model;
+        } else {
+            t.* = r.trace;
+        }
+    }
     return abi.STATUS_OK;
+}
+
+/// ABI 1.2 (ADR-0014): the fingerprint of `ee_model_trace`, for a host to compare against
+/// `EE_MODEL_FINGERPRINT`. The 1.0 and 1.1 fingerprints did not move.
+pub export fn ee_model_fingerprint() u64 {
+    return abi.MODEL_FINGERPRINT;
 }
 
 // ── Shutdown ────────────────────────────────────────────────────────────────

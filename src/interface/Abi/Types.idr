@@ -56,10 +56,16 @@ ptrBytes Windows64 = 8
 --------------------------------------------------------------------------------
 
 ||| The C-level types the ABI is built from. Sizes and alignments are the
-||| System V / Windows x86-64 values for the fixed-width types plus the two
+||| System V / Windows x86-64 values for the fixed-width types plus the
 ||| composite types this ABI defines.
+|||
+||| `CMindTrace` (ABI 1.2, ADR-0014) is `ee_mind_trace` used as a FIELD: the first
+||| member of `ee_model_trace`, so the 1.1 record is a prefix of the 1.2 one by C's own
+||| layout rules, and a host passes `&model.mind` where `ee_tick_mind` takes an
+||| `ee_mind_trace *`. Its size is `Abi.Layout.mindTraceSize` (32) and its alignment
+||| that of its `tick` field (8).
 public export
-data CType = U8 | U16 | U32 | U64 | I32 | I64 | Fx | CVersion | CContact
+data CType = U8 | U16 | U32 | U64 | I32 | I64 | Fx | CVersion | CContact | CMindTrace
 
 public export
 sizeOf : CType -> Nat
@@ -72,6 +78,7 @@ sizeOf I64 = 8
 sizeOf Fx = 4
 sizeOf CVersion = 8
 sizeOf CContact = 16
+sizeOf CMindTrace = 32
 
 public export
 alignOf : CType -> Nat
@@ -84,6 +91,7 @@ alignOf I64 = 8
 alignOf Fx = 4
 alignOf CVersion = 2
 alignOf CContact = 4
+alignOf CMindTrace = 8
 
 --------------------------------------------------------------------------------
 -- Fixed point
@@ -128,9 +136,16 @@ record Version where
 ||| `ee_intent.flags` and `ee_contact.flags`. No existing field changed meaning, size
 ||| or offset, `EE_ABI_FINGERPRINT` is still computed over the seven 1.0 structs
 ||| only (see `frozenStructs`), and `ee_tick` is the same function it was at 1.0.
+|||
+||| 1.2 (ADR-0014) is additive in the same way: one new capability
+||| (`EE_CAP_OBSERVATION_CUES`), one new caller-owned struct (`ee_model_trace`, whose
+||| first member IS the 1.1 `ee_mind_trace`), and bits and codes that 1.1 left
+||| undefined (`ee_contact.flags` bit 1, `ee_agent.flags` bits 4 and 8..15, mode code 5,
+||| `ee_intent.flags` bit 7, `ee_mind_trace.tells` bit 3). No new entrance: the
+||| struct_size the host writes into the trace says which record it passed.
 public export
 abiVersion : Version
-abiVersion = MkVersion 1 1 0
+abiVersion = MkVersion 1 2 0
 
 public export
 data Handshake
@@ -210,6 +225,7 @@ data Capability
   | CapSoundEvents
   | CapVehicleBoarding
   | CapTerrainHeight
+  | CapObservationCues
 
 ||| Bit index of each capability in the u32 mask.
 public export
@@ -224,6 +240,7 @@ capBit CapDamageEvents = 6
 capBit CapSoundEvents = 7
 capBit CapVehicleBoarding = 8
 capBit CapTerrainHeight = 9
+capBit CapObservationCues = 10
 
 ||| Every capability fits in the 32-bit mask, proved per constructor.
 ||| (One case per constructor: a new capability added without checking this fails
@@ -240,6 +257,7 @@ capBitFits CapDamageEvents = Oh
 capBitFits CapSoundEvents = Oh
 capBitFits CapVehicleBoarding = Oh
 capBitFits CapTerrainHeight = Oh
+capBitFits CapObservationCues = Oh
 
 --------------------------------------------------------------------------------
 -- Actions
@@ -441,6 +459,28 @@ mindTraceFields =
   , ("cause", U8)
   , ("tells", U8)
   , ("reserved0", U8)
+  ]
+
+||| ABI 1.2 (ADR-0014): the 1.1 trace record, then the agent's MODEL of its target's
+||| knowledge — exposure, "T knows where I am". The first member is the whole 1.1 record,
+||| so a 1.1 reader of the first 32 bytes reads exactly what it always read.
+|||
+||| `exposure` is the belief as the tick CLOSED (0 or 1), `exposure_prev` as it opened,
+||| `exposure_cause` an `EE_EXPOSURE_CAUSE_*` code that is NONE exactly when the two are
+||| equal, and `exposure_contact` the contact behind that cause (the observer for a cue,
+||| the struck target for an own attack, 0 for expiry and for no change). The lifetime
+||| counter that keeps the belief alive is NOT here: it is belief bookkeeping, held in
+||| `ee_agent.flags`, and the trace carries the belief and its causes, not its clock.
+public export
+modelTraceFields : List (String, CType)
+modelTraceFields =
+  [ ("mind", CMindTrace)
+  , ("exposure_contact", U16)
+  , ("exposure", U8)
+  , ("exposure_prev", U8)
+  , ("exposure_cause", U8)
+  , ("reserved0", U8)
+  , ("reserved1", U16)
   ]
 
 --------------------------------------------------------------------------------
@@ -683,6 +723,92 @@ public export
 massFull : Nat
 massFull = 10000
 
+--------------------------------------------------------------------------------
+-- ABI 1.2: the model of the target's knowledge (ADR-0014) — wire constants only
+--------------------------------------------------------------------------------
+-- As for the mind: the NAMES a host needs. The lifetime, the strike range, the stalk
+-- weight and its speed are policy and live in `Abi.Exposure` and the kernel only.
+
+||| `ee_contact.flags` bit 1: THIS CONTACT OBSERVES THE AGENT on this tick — the host's
+||| own rule (line of sight and facing, for example). Read only by `ee_tick_mind`, and
+||| only when the host declared `EE_CAP_OBSERVATION_CUES`; ignored otherwise.
+public export
+contactFlagObserves : Nat
+contactFlagObserves = 2
+
+||| `ee_agent.flags` bit 4: the agent believes it is exposed — the belief as the last
+||| `ee_tick_mind` closed. Exposure is a BELIEF, so it lives beside the memory (bit 0),
+||| not with the affect in `ee_mind`. Written only under `EE_CAP_OBSERVATION_CUES`.
+public export
+agentFlagExposed : Nat
+agentFlagExposed = 16
+
+||| `ee_agent.flags` bits 8..15: ticks the exposure belief still has to live without a
+||| new cue. A COUNTER, not a leak: a floored leak never drains (ADR-0013 §3).
+public export
+agentExposureShift : Nat
+agentExposureShift = 8
+
+public export
+agentExposureMask : Nat
+agentExposureMask = 65280
+
+||| Mode code 5: STALK, in the mode field (bits 1..3) that 1.0 sized for eight codes and
+||| filled with five. Only `ee_tick_mind` under `EE_CAP_OBSERVATION_CUES` enters it.
+public export
+agentModeStalk : Nat
+agentModeStalk = 5
+
+||| `ee_intent.flags` bit 7 and `ee_mind_trace.tells` bit 3: CAUGHT — the cue arrived
+||| while the agent stalked. The body froze for this tick.
+public export
+intentFlagCaught : Nat
+intentFlagCaught = 128
+
+public export
+tellCaught : Nat
+tellCaught = 8
+
+||| Why exposure changed: `ee_model_trace.exposure_cause`. NONE exactly when it did not.
+public export
+exposureCauseNone : Nat
+exposureCauseNone = 0
+
+public export
+exposureCauseCue : Nat
+exposureCauseCue = 1
+
+public export
+exposureCauseOwnAttack : Nat
+exposureCauseOwnAttack = 2
+
+public export
+exposureCauseExpiry : Nat
+exposureCauseExpiry = 3
+
+||| The new agent bits sit above the mode field (mask 14) and below the counter (256),
+||| and the counter is exactly bits 8..15, so no 1.2 write can touch the memory flag or
+||| the mode, and the mode write (`setMode`, which masks 14) cannot touch exposure.
+export
+exposureBitsClearOfTheFrozenBits :
+  ( So (Abi.Types.agentModeMask < Abi.Types.agentFlagExposed)
+  , So (Abi.Types.agentFlagExposed < 256)
+  , Abi.Types.agentExposureMask = 255 * 256 )
+exposureBitsClearOfTheFrozenBits = (Oh, Oh, Refl)
+
+||| Stalk's code fits the mode field: 5 shifted by one is 10, inside the mask 14.
+export
+stalkFitsTheModeField : So (Abi.Types.agentModeStalk * 2 <= Abi.Types.agentModeMask)
+stalkFitsTheModeField = Oh
+
+||| CAUGHT keeps the tells rule: the intent bit is the trace bit shifted up by four, and
+||| it is above every 1.0 and 1.1 intent bit (the highest of which is 64).
+export
+caughtIsTheTraceTellShifted :
+  ( Abi.Types.intentFlagCaught = Abi.Types.tellCaught * 16
+  , So (Abi.Types.intentFlagFixate < Abi.Types.intentFlagCaught) )
+caughtIsTheTraceTellShifted = (Refl, Oh)
+
 ||| The tells sit above every 1.0 intent bit: the lowest tell (16) is above the
 ||| highest 1.0 bit (8), so no tell can be mistaken for a 1.0 flag.
 export
@@ -715,6 +841,7 @@ capName CapDamageEvents = "DAMAGE_EVENTS"
 capName CapSoundEvents = "SOUND_EVENTS"
 capName CapVehicleBoarding = "VEHICLE_BOARDING"
 capName CapTerrainHeight = "TERRAIN_HEIGHT"
+capName CapObservationCues = "OBSERVATION_CUES"
 
 public export
 statusName : Status -> String
@@ -743,7 +870,7 @@ allCapabilities : List Capability
 allCapabilities =
   [ CapNavmesh, CapLineOfSight, CapRaycast, CapWaypointGraph, CapSpawnRights
   , CapAnimationHooks, CapDamageEvents, CapSoundEvents, CapVehicleBoarding
-  , CapTerrainHeight ]
+  , CapTerrainHeight, CapObservationCues ]
 
 public export
 allStatuses : List Status
@@ -795,10 +922,18 @@ mindStructs =
   , MkStruct "ee_mind_trace" mindTraceFields
   ]
 
-||| Every struct the header emits, frozen first, in emission order.
+||| The struct ABI 1.2 adds (ADR-0014), with its own fingerprint,
+||| `EE_MODEL_FINGERPRINT`. Kept out of `mindStructs` for the reason `frozenStructs`
+||| is kept out of everything: a 1.1 host compiled `EE_MIND_FINGERPRINT`, and the
+||| number must not move under it.
+public export
+modelStructs : List Struct
+modelStructs = [ MkStruct "ee_model_trace" modelTraceFields ]
+
+||| Every struct the header emits, oldest first, in emission order.
 public export
 allStructs : List Struct
-allStructs = frozenStructs ++ mindStructs
+allStructs = frozenStructs ++ mindStructs ++ modelStructs
 
 ||| The literal size list that `Abi.Layout` proves theorems about, paired with
 ||| the same struct, so `Abi.Gen` can cross-check named fields against proven
@@ -815,4 +950,5 @@ provenSizeLists =
   , [4, 4, 4, 4, 4, 4, 8, 8, 8, 8, 8, 8]
   , [4, 4, 8, 8, 4, 4, 4, 4, 4, 4, 2, 2, 1, 1, 1, 1]
   , [4, 4, 8, 4, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]
+  , [32, 2, 1, 1, 1, 1, 2]
   ]

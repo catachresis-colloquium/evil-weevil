@@ -182,18 +182,25 @@ fn zeroTrace() abi.EeMindTrace {
     return t;
 }
 
-test "1.1: version_info reports minor 1, and the 1.0 fingerprint did not move" {
+test "1.2: version_info reports minor 2, and neither the 1.0 nor the 1.1 fingerprint moved" {
+    // ABI 1.2 (ADR-0014) is additive, so the minor moves and nothing else does. This test
+    // asserted minor 1 at 1.1; the minor is the one number an additive change must move.
     const v = ee.ee_version_info();
     try std.testing.expectEqual(@as(u16, 1), v.major);
-    try std.testing.expectEqual(@as(u16, 1), v.minor);
-    // A 1.0 host compiled 18276775 into its binary; ee_init must still accept it.
+    try std.testing.expectEqual(@as(u16, 2), v.minor);
+    // A 1.0 host compiled 18276775 into its binary; ee_init must still accept it, and a
+    // 1.1 host likewise. A 1.1 host compiled 1047490 as the mind fingerprint.
     try std.testing.expectEqual(@as(u64, 18276775), ee.ee_abi_fingerprint());
-    var desc = zeroDesc();
-    desc.abi_minor = 0;
-    desc.abi_fingerprint = 18276775;
-    var ctx = zeroCtx();
-    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    for ([_]u32{ 0, 1 }) |minor| {
+        var desc = zeroDesc();
+        desc.abi_minor = minor;
+        desc.abi_fingerprint = 18276775;
+        var ctx = zeroCtx();
+        try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    }
+    try std.testing.expectEqual(@as(u64, 1047490), ee.ee_mind_fingerprint());
     try std.testing.expectEqual(abi.MIND_FINGERPRINT, ee.ee_mind_fingerprint());
+    try std.testing.expectEqual(abi.MODEL_FINGERPRINT, ee.ee_model_fingerprint());
 }
 
 test "1.1: tick_mind answers, writes a trace, and accepts a NULL trace" {
@@ -246,4 +253,81 @@ test "1.1: tick_mind refuses bad arguments and short structs, and writes nothing
 
     var uninit = zeroCtx();
     try std.testing.expectEqual(abi.STATUS_VERSION_MISMATCH, ee.ee_tick_mind(&uninit, &snap, &agent, &mind, &out, &trace));
+}
+
+// ── ABI 1.2: the model trace (ADR-0014) ──────────────────────────────────────
+
+test "1.2: a 1.1-sized trace is written as at 1.1, and nothing past its 32 bytes is touched" {
+    // A 1.1 host passes a 32-byte record. Even with the cue capability declared and a cue
+    // given, the kernel writes 32 bytes and writes its size back as 32 — measured here with
+    // a canary in the eight bytes a 1.2 record would occupy.
+    var desc = zeroDesc();
+    desc.capabilities = abi.CAP_NAVMESH | abi.CAP_OBSERVATION_CUES;
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    var snap = zeroSnapshot();
+    snap.contact0.distance = 100000;
+    snap.contact0.flags = @intCast(abi.CONTACT_FLAG_OBSERVES);
+    var agent = zeroAgent();
+    var mind = zeroMind();
+    var out = std.mem.zeroes(abi.EeIntent);
+    var buf: abi.EeModelTrace = undefined;
+    @memset(std.mem.asBytes(&buf), 0xAA);
+    buf.mind.struct_size = @sizeOf(abi.EeMindTrace);
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, &buf.mind));
+    try std.testing.expectEqual(@as(u32, @sizeOf(abi.EeMindTrace)), buf.mind.struct_size);
+    for (std.mem.asBytes(&buf)[@sizeOf(abi.EeMindTrace)..]) |b| try std.testing.expectEqual(@as(u8, 0xAA), b);
+    // The belief still formed: it lives in the agent, not in the trace.
+    try std.testing.expect(agent.flags & abi.AGENT_FLAG_EXPOSED != 0);
+}
+
+test "1.2: a 1.2-sized trace receives the model, and its size comes back as 40" {
+    var desc = zeroDesc();
+    desc.capabilities = abi.CAP_NAVMESH | abi.CAP_OBSERVATION_CUES;
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    var snap = zeroSnapshot();
+    snap.contact0.distance = 100000;
+    var agent = zeroAgent();
+    var mind = zeroMind();
+    var out = std.mem.zeroes(abi.EeIntent);
+    var mt = std.mem.zeroes(abi.EeModelTrace);
+    mt.mind.struct_size = @sizeOf(abi.EeModelTrace);
+
+    // Tick 0: unseen, the target beyond strike range: the agent stalks.
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, &mt.mind));
+    try std.testing.expectEqual(@as(u32, 40), mt.mind.struct_size);
+    try std.testing.expectEqual(abi.ACTION_TAKE_COVER, out.action);
+    try std.testing.expectEqual(@as(u8, @intCast(abi.AGENT_MODE_STALK)), mt.mind.selected);
+    try std.testing.expectEqual(@as(u8, 6), mt.mind.ranking_count);
+    try std.testing.expectEqual(@as(u8, 0), mt.exposure);
+
+    // Tick 1: the target looks. CAUGHT, a frozen body, and exposure with its cause.
+    snap.tick = 1;
+    snap.contact0.flags = @intCast(abi.CONTACT_FLAG_OBSERVES);
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, &mt.mind));
+    try std.testing.expectEqual(abi.ACTION_HOLD, out.action);
+    try std.testing.expect(out.flags & abi.INTENT_FLAG_CAUGHT != 0);
+    try std.testing.expect(mt.mind.tells & abi.TELL_CAUGHT != 0);
+    try std.testing.expectEqual(@as(u8, 1), mt.exposure);
+    try std.testing.expectEqual(@as(u8, 0), mt.exposure_prev);
+    try std.testing.expectEqual(@as(u8, @intCast(abi.EXPOSURE_CAUSE_CUE)), mt.exposure_cause);
+    try std.testing.expectEqual(@as(u16, 42), mt.exposure_contact);
+    try std.testing.expectEqual(@as(u8, 5), mt.mind.ranking_count); // exposed: 1.1's ranking
+}
+
+test "1.2: without a navmesh the stalker keeps to its cover" {
+    var desc = zeroDesc();
+    desc.capabilities = abi.CAP_OBSERVATION_CUES;
+    var ctx = zeroCtx();
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_init(&desc, &ctx));
+    var snap = zeroSnapshot();
+    snap.contact0.distance = 100000;
+    var agent = zeroAgent();
+    var mind = zeroMind();
+    var out = std.mem.zeroes(abi.EeIntent);
+    try std.testing.expectEqual(abi.STATUS_OK, ee.ee_tick_mind(&ctx, &snap, &agent, &mind, &out, null));
+    try std.testing.expectEqual(abi.ACTION_TAKE_COVER, out.action);
+    try std.testing.expectEqual(@as(i32, 0), out.speed);
+    try std.testing.expect(out.flags & abi.INTENT_FLAG_UNREACHABLE != 0);
 }

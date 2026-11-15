@@ -97,6 +97,38 @@ infer from the code, recorded here because each will surprise somebody:
    ADR-0013 §9 records, for every mind constant, which of these six a one-at-a-time
    perturbation moved: all 26 perturbations moved at least one.
 
+   *ABI 1.2, mind slice 2 (ADR-0014, 2026-11-14).* None of the ten pins above moved.
+   That was this slice's acceptance test, and it was chosen before the work began. Both
+   hosts still assert all ten. The new pins are the four fixtures of
+   `EE_CAP_OBSERVATION_CUES`, each with a control that withholds only that capability,
+   and the all-bits chase. Their fold also covers the intent's speed and priority and
+   the model fields (exposure, its previous value, its cause and its contact). So a
+   change to how the agent models its target moves them, as well as a change to what it
+   does.
+
+   [cols="2,2,1,3", options="header"]
+   |===
+   | Pin | Value | Before | Fixture
+   | model: the stalker | 5067313941334346860 | — | unseen: stalks, first engage at 160 at strike range
+   | model: the stalker's control | 5359463348611598049 | — | no cue capability: first engage at 64 at attack range
+   | model: caught | 3395485040061069912 | — | one CAUGHT at 100, exposed from it, no more stalking
+   | model: caught's control | 5359463348611598049 | — | the same as the stalker's control: the cue bit is ignored without the capability
+   | model: false exposure | 11105738738098638480 | — | 90 exposed ticks with no cue
+   | model: false exposure's control | 11366903142131820018 | — | 0 exposed ticks
+   | model: the ambush | 1370696199260345134 | — | exposure set by the agent's own attack, expiring at 120
+   | model: the ambush's control | 10128845661911672413 | — | no exposure
+   | model: chase, all bits declared | 421035655961441872 | — | ADR-0012's chase at rest with `0xFFFF_FFFF`, which now declares the cue capability: false concealment
+   |===
+
+   One test changed its INPUT and kept its pin. "A mind held at rest reproduces 1.0's
+   chase" declared `0xFFFF_FFFF`. It now declares the ten capabilities that 1.1
+   defined, and its value is still 12283675074724005768. The reason is ADR-0014 §9. The
+   old input is the last row above.
+
+   ADR-0014 §8 records, for every model constant, which pins a one-at-a-time
+   perturbation moved. All five perturbations moved at least one pin, and none moved a
+   1.0 or 1.1 pin.
+
    The S2 pin carries an extra assertion the others do not need, because its value is
    not a behaviour but the ABSENCE of churn: both hosts also check that the action
    changes zero times in 100 ticks. Measured both ways on the same fixture, the graph
