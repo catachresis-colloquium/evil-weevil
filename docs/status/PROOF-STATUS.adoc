@@ -20,7 +20,7 @@
 | *Total* | *7* | *5* | *0* | *0* | *2*
 |===
 
-*Overall*: 71% proven (all five ABI/FFI proofs compile under idris2 0.7.0; the two
+*Overall*: 5 of 7 obligations proven (all five ABI/FFI proofs compile under idris2 0.7.0; the two
 Typing proofs are not yet written)
 
 The five ABI proofs are `gated` in `verification/proofs/idris2/MANIFEST`, so they are
