@@ -366,8 +366,13 @@ install_idris2() {
     # the install is verified. Any `scheme` or `chez` on PATH is not enough: if it
     # is not that path, idris2 still cannot start, verification answers rc=3, and a
     # good cache is thrown away and rebuilt from source.
+    #
+    # If that interpreter cannot be supplied (a cache built where Chez lived at a
+    # path no package provides), the install is not abandoned: verification answers
+    # rc=3 and the install is rebuilt against the Chez this machine has, as before.
     if [ -x "$dir/bin/idris2" ]; then
-        ensure_chez_runtime "$dir/bin/idris2"
+        ensure_chez_runtime "$dir/bin/idris2" \
+            || say "    the cached install's interpreter cannot be supplied; it will be rebuilt"
         ln -sf "$dir/bin/idris2" "$PREFIX/bin/idris2"
         local reuse_rc=0
         verify_idris2 || reuse_rc=$?
@@ -380,11 +385,20 @@ install_idris2() {
         fi
     fi
     if [ ! -x "$dir/bin/idris2" ]; then
-        # Bootstrapping needs a Chez Scheme of any name, plus GMP and a C toolchain.
-        if ! have chezscheme && ! have scheme && ! have chez; then
-            say "    installing chezscheme (to bootstrap Idris2)"
+        # Bootstrapping needs a Chez Scheme of any name, plus make, a C compiler and
+        # GMP's headers. Each is checked on its own: the reuse path above may have
+        # just installed chezscheme, which brings none of the others with it.
+        local build_pkgs=""
+        have chezscheme || have scheme || have chez || build_pkgs="chezscheme"
+        { have make && have cc; } || build_pkgs="$build_pkgs build-essential"
+        if ! { have cc && printf '#include <gmp.h>\n' | cc -E -x c - >/dev/null 2>&1; }; then
+            build_pkgs="$build_pkgs libgmp-dev"
+        fi
+        if [ -n "$build_pkgs" ]; then
+            say "    installing what bootstrapping Idris2 needs:$build_pkgs"
             $SUDO apt-get update -qq
-            $SUDO apt-get install -y -qq chezscheme libgmp-dev build-essential
+            # shellcheck disable=SC2086  # a word list, split on purpose
+            $SUDO apt-get install -y -qq $build_pkgs
         fi
         local scheme
         scheme="$(command -v chezscheme || command -v scheme || command -v chez)"
