@@ -125,22 +125,6 @@ JUST_HAVE="$(just_version)"
 SUDO=""
 [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 
-# Chez Scheme is a RUN-TIME dependency of an Idris2 built with the Chez backend,
-# not only a build-time one: bin/idris2 executes bin/idris2_app/idris2.so, whose
-# first line is `#!/usr/bin/chezscheme --program`. Chez is a system package, so
-# no cache of the toolchain prefix carries it. This used to be installed only on
-# the BUILD path, so the first CI run to restore a good cache (PR #11, 2026-11-14)
-# found idris2 present and unable to start: "idris2_app/idris2.so: not found" is
-# sh reporting the missing interpreter. Ensured whenever idris2 is wanted.
-ensure_chez() {
-    if have chezscheme || have scheme || have chez; then
-        return 0
-    fi
-    say "    installing chezscheme (Idris2's Chez backend needs it to RUN, not only to build)"
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y -qq chezscheme libgmp-dev build-essential
-}
-
 # ── Verify, rather than announce ─────────────────────────────────────────────
 # A toolchain script's job is that the tools WORK, not that they exist. A compiler
 # that starts and cannot find its own base library is a failure no version string
@@ -228,8 +212,8 @@ ensure_chez_runtime() {
     [ -n "$interp" ] || return 0
     [ -x "$interp" ] && return 0
     say "    idris2 needs the Chez Scheme runtime at $interp, which is missing"
-    say "    installing chezscheme (needs sudo)"
-    if ! { sudo apt-get update -qq && sudo apt-get install -y -qq chezscheme; }; then
+    say "    installing chezscheme"
+    if ! { $SUDO apt-get update -qq && $SUDO apt-get install -y -qq chezscheme; }; then
         say "    FAIL: could not install chezscheme, and idris2 cannot start without"
         say "          $interp. Install Chez Scheme, then re-run this script."
         return 1
@@ -369,13 +353,21 @@ install_idris2() {
     say ""
     say "==> idris2 $IDRIS2_VERSION (bootstrapped with Chez Scheme)"
     local dir="$PREFIX/idris2-$IDRIS2_VERSION"
-    ensure_chez
     mkdir -p "$PREFIX/bin"
     # An install already in the prefix (a restored cache, an earlier run) is
     # VERIFIED before it is reused, and rebuilt if it fails. It used to be trusted
     # because bin/idris2 existed, which is how a cache hit reached the final
     # verification with an idris2 that could not start.
+    #
+    # Chez Scheme is a RUN-TIME dependency, not only a build-time one: bin/idris2
+    # executes bin/idris2_app/idris2.so, whose first line names the interpreter it
+    # was built for (`#!/usr/bin/chezscheme --program`). No cache of the prefix can
+    # carry a system package, so the interpreter THAT LINE NAMES is ensured before
+    # the install is verified. Any `scheme` or `chez` on PATH is not enough: if it
+    # is not that path, idris2 still cannot start, verification answers rc=3, and a
+    # good cache is thrown away and rebuilt from source.
     if [ -x "$dir/bin/idris2" ]; then
+        ensure_chez_runtime "$dir/bin/idris2"
         ln -sf "$dir/bin/idris2" "$PREFIX/bin/idris2"
         local reuse_rc=0
         verify_idris2 || reuse_rc=$?
@@ -388,6 +380,12 @@ install_idris2() {
         fi
     fi
     if [ ! -x "$dir/bin/idris2" ]; then
+        # Bootstrapping needs a Chez Scheme of any name, plus GMP and a C toolchain.
+        if ! have chezscheme && ! have scheme && ! have chez; then
+            say "    installing chezscheme (to bootstrap Idris2)"
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq chezscheme libgmp-dev build-essential
+        fi
         local scheme
         scheme="$(command -v chezscheme || command -v scheme || command -v chez)"
 
